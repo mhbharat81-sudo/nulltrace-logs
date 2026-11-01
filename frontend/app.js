@@ -55,6 +55,9 @@ async function populateUploadedDatasets() {
       } else if (d.dataset_id === 'firex-30g-ngfw' || (d.filename && d.filename.includes('30g'))) {
         icon = '🌐';
         label = `FortiGate 30G NGFW (${countStr})`;
+      } else if (d.filename && (d.filename.includes('10G') || d.filename.includes('10g')) && d.event_count && d.event_count > 100000) {
+        icon = '🔥';
+        label = `FortiGate 10G Enterprise (${countStr})`;
       } else if (d.dataset_id === 'firex-10g-ngfw' || (d.filename && d.filename.includes('10g'))) {
         icon = '🌐';
         label = `FortiGate 10G NGFW (${countStr})`;
