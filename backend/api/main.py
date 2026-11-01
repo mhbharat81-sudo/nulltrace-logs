@@ -5,8 +5,10 @@ attack graph visualization, blast radius reachability, and detection evaluation.
 """
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
+import logging
 import os
 import re
 import shutil
@@ -62,6 +64,8 @@ async def add_no_cache_header(request, call_next):
     return response
 
 _main_event_loop: Optional[asyncio.AbstractEventLoop] = None
+_upload_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
 
 @app.on_event("startup")
 async def _on_startup():
@@ -862,11 +866,14 @@ async def post_simulate_stream(dataset_id: Optional[str] = None):
     ]
 
     async def _stream_tasks():
-        for st in steps:
-            await asyncio.sleep(0.4)
-            d = ws_manager.process_live_event(st, dataset_id=ds_id)
-            if d:
-                await ws_manager.broadcast_delta(d)
+        try:
+            for st in steps:
+                await asyncio.sleep(0.4)
+                d = ws_manager.process_live_event(st, dataset_id=ds_id)
+                if d:
+                    await ws_manager.broadcast_delta(d)
+        except Exception as e:
+            logging.error(f"Live stream simulation error: {e}")
 
     asyncio.create_task(_stream_tasks())
     return {"status": "streaming_started", "total_steps": len(steps)}
@@ -1044,9 +1051,6 @@ async def upload_log_file(
 
 
 # ── Resumable Chunked Upload & Async Large Log Ingestion ─────────────────────
-_upload_jobs: Dict[str, Dict[str, Any]] = {}
-_jobs_lock = threading.Lock()
-
 class UploadCompleteRequest(BaseModel):
     upload_id: str
     filename: str
