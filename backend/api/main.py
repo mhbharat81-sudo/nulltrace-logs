@@ -160,10 +160,11 @@ def get_stats(dataset_id: Optional[str] = None):
         tacts = json.loads(inc[5]) if inc[5] else []
         stage_num = f"{idx + 1:02d}"
 
-        raw_title = inc[2] if inc[2] and "chain" not in inc[2].lower() else (inc[1] or inc[2])
-        short_title = raw_title.split(".")[0].split(":")[-1].strip()
-        if len(short_title) > 60:
-            short_title = short_title[:57] + "..."
+        raw_title = inc[1] or inc[2] or "Correlated Attack Campaign"
+        if len(raw_title) > 60:
+            short_title = raw_title[:57].strip() + "..."
+        else:
+            short_title = raw_title.strip()
 
         raw_tactic = tacts[0] if tacts else "Threat Execution"
         clean_tactic = raw_tactic.strip("[]").strip("'\"")
@@ -223,6 +224,7 @@ def list_datasets():
         FROM datasets d
         LEFT JOIN (SELECT dataset_id, count(*) as cnt FROM events GROUP BY dataset_id) e ON d.dataset_id = e.dataset_id
         LEFT JOIN (SELECT dataset_id, count(*) as cnt FROM detections GROUP BY dataset_id) det ON d.dataset_id = det.dataset_id
+        WHERE COALESCE(e.cnt, 0) > 0 OR d.status IN ('registered', 'ingested')
         ORDER BY d.created_at DESC
     """).fetchall()
 

@@ -225,13 +225,14 @@ def process_uploaded_log(
     norm_rows = []
     intercepted_threats: List[Dict[str, Any]] = []
     seq = 0
-    BATCH_SIZE = 10000
+    BATCH_SIZE = 25000
     t_start = time.perf_counter()
+    last_notify_ts = 0.0
 
     app_ev = conn.appender("events")
     app_norm = conn.appender("normalized_events")
 
-    _notify_progress(progress_callback, 0, "Initializing live in-flight threat interception stream...")
+    _notify_progress(progress_callback, 0, "Initializing high-speed in-flight threat interception stream...")
 
     with _open_file() as f:
         for line in f:
@@ -412,7 +413,10 @@ def process_uploaded_log(
                     "detail": (cmdline or desc or atk or f"Detected threat signature on {host_name}")[:150]
                 }
                 intercepted_threats.append(threat_intercept)
-                _notify_progress(progress_callback, seq, f"INTERCEPTED: {t_nm}", threat_intercept)
+                now_ts = time.perf_counter()
+                if now_ts - last_notify_ts >= 0.10:
+                    last_notify_ts = now_ts
+                    _notify_progress(progress_callback, seq, f"INTERCEPTED: {t_nm}", threat_intercept)
 
             event_rows.append((
                 seq, event_id, dataset_id, ts, "alert" if tech_id else "event",
@@ -439,7 +443,10 @@ def process_uploaded_log(
                 app_norm.flush()
                 norm_rows.clear()
 
-                _notify_progress(progress_callback, seq, f"Ingested {seq:,} records into DuckDB...")
+                now_ts = time.perf_counter()
+                if now_ts - last_notify_ts >= 0.12:
+                    last_notify_ts = now_ts
+                    _notify_progress(progress_callback, seq, f"Ingested {seq:,} records into DuckDB...")
 
             # Only break if max_records is explicitly provided and greater than 0
             if max_records is not None and max_records > 0 and seq >= max_records:

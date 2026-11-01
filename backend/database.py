@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_seq       ON events(seq_num);
+CREATE INDEX IF NOT EXISTS idx_events_dataset   ON events(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_events_host      ON events(host_name);
 CREATE INDEX IF NOT EXISTS idx_events_user      ON events(user_name);
 CREATE INDEX IF NOT EXISTS idx_events_category  ON events(event_category);
@@ -213,6 +214,7 @@ CREATE TABLE IF NOT EXISTS detections (
 );
 
 CREATE INDEX IF NOT EXISTS idx_det_rule_id   ON detections(rule_id);
+CREATE INDEX IF NOT EXISTS idx_det_dataset   ON detections(dataset_id);
 CREATE INDEX IF NOT EXISTS idx_det_host      ON detections(host_name);
 CREATE INDEX IF NOT EXISTS idx_det_user      ON detections(user_name);
 CREATE INDEX IF NOT EXISTS idx_det_technique ON detections(technique_id);
