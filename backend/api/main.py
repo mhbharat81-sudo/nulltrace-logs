@@ -1445,21 +1445,28 @@ def ingest_local_file(req: IngestLocalRequest):
 
 class ResetDatasetsRequest(BaseModel):
     mode: str = "purge_uploads"
+    dataset_id: Optional[str] = None
 
 @app.post('/api/datasets/reset')
 def reset_datasets_endpoint(req: ResetDatasetsRequest):
     """Clean up uploaded datasets and reset state so the user can start again cleanly."""
     conn = get_db(read_only=False)
-    uploads = conn.execute("SELECT dataset_id FROM datasets WHERE dataset_id LIKE 'upload-%' OR dataset_id LIKE 'local-%'").fetchall()
-    u_ids = [u[0] for u in uploads]
+    if req.dataset_id:
+        u_ids = [req.dataset_id]
+    else:
+        uploads = conn.execute("SELECT dataset_id FROM datasets WHERE dataset_id LIKE 'upload-%' OR dataset_id LIKE 'local-%'").fetchall()
+        u_ids = [u[0] for u in uploads]
+
     for uid in u_ids:
         conn.execute("DELETE FROM incident_detections WHERE incident_id IN (SELECT incident_id FROM incidents WHERE dataset_id = ?)", [uid])
         conn.execute("DELETE FROM incidents WHERE dataset_id = ?", [uid])
         conn.execute("DELETE FROM detections WHERE dataset_id = ?", [uid])
-        conn.execute("DELETE FROM normalized_events WHERE event_id IN (SELECT event_id FROM events WHERE dataset_id = ?)", [uid])
-        conn.execute("DELETE FROM event_entities WHERE event_id IN (SELECT event_id FROM events WHERE dataset_id = ?)", [uid])
+        conn.execute("DELETE FROM normalized_events USING events WHERE normalized_events.event_id = events.event_id AND events.dataset_id = ?", [uid])
+        conn.execute("DELETE FROM event_entities USING events WHERE event_entities.event_id = events.event_id AND events.dataset_id = ?", [uid])
         conn.execute("DELETE FROM events WHERE dataset_id = ?", [uid])
         conn.execute("DELETE FROM datasets WHERE dataset_id = ?", [uid])
+    conn.commit()
+
     return {
         "status": "ok",
         "purged_count": len(u_ids),

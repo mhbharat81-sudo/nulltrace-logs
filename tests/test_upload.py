@@ -28,6 +28,7 @@ def test_upload_jsonl_log_file():
     assert data["total_records"] == 2
     assert "upload-" in data["dataset_id"]
     assert data["detections_count"] >= 1
+    assert data["incidents_count"] >= 1
     assert data["graph_nodes"] >= 2
 
 
@@ -49,6 +50,7 @@ def test_upload_fortigate_kv_log_file():
     assert data["total_records"] == 2
     assert data["format"] == "kv_log"
     assert data["detections_count"] >= 1
+    assert data["incidents_count"] >= 1
 
 
 def test_resumable_chunked_upload_and_job_pipeline():

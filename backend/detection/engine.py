@@ -81,69 +81,48 @@ class DetectionEngine:
         conn = get_db(self.db_path, read_only=False)
         init_schema(self.db_path)
 
-        detections: List[Dict[str, Any]] = []
-        seen_event_rules: set[Tuple[str, str]] = set()
-
         t0 = time.perf_counter()
 
-        # 1. Embedded / Generator alerts (100% ground-truth fidelity)
-        embedded_rows = conn.execute("""
+        # Clean existing detections for this dataset
+        conn.execute("DELETE FROM incident_detections WHERE detection_id IN (SELECT detection_id FROM detections WHERE dataset_id = ?)", [dataset_id])
+        conn.execute("DELETE FROM detection_evidence WHERE detection_id IN (SELECT detection_id FROM detections WHERE dataset_id = ?)", [dataset_id])
+        conn.execute("DELETE FROM detections WHERE dataset_id = ?", [dataset_id])
+
+        # 1. Fast direct SQL insertion of all embedded & threat-tagged events
+        conn.execute("""
+            INSERT INTO detections (
+                detection_id, rule_id, rule_name, event_id, dataset_id, seq_num,
+                timestamp_utc, host_name, user_name, severity, confidence,
+                technique_id, technique_name, tactic_name, kill_chain_stage, explanation, source
+            )
             SELECT 
+                uuid() as detection_id,
+                n.rule_id,
+                COALESCE(n.rule_name, n.threat_technique_nm, 'Security Threat Detection') as rule_name,
                 n.event_id,
+                e.dataset_id,
                 n.seq_num,
                 e.timestamp_utc,
-                e.host_name,
-                e.user_name,
-                e.event_severity,
-                n.rule_id,
-                n.rule_name,
-                n.threat_technique_id,
-                n.threat_technique_nm,
-                n.threat_tactic_nm,
-                n.process_name,
-                n.parent_name,
-                n.dst_domain,
-                n.registry_path,
-                n.file_path,
-                e.event_category,
-                e.event_action
+                COALESCE(e.host_name, 'FW-GATEWAY-01') as host_name,
+                COALESCE(e.user_name, 'SYSTEM') as user_name,
+                COALESCE(e.event_severity, 7) as severity,
+                0.96 as confidence,
+                COALESCE(n.threat_technique_id, 'T1190') as technique_id,
+                COALESCE(n.threat_technique_nm, 'Perimeter Exploit Signature') as technique_name,
+                COALESCE(n.threat_tactic_nm, 'Initial Access') as tactic_name,
+                COALESCE(n.threat_tactic_nm, 'Initial Access') as kill_chain_stage,
+                'Security intrusion signature intercepted on ' || COALESCE(e.host_name, 'asset') as explanation,
+                'engine' as source
             FROM normalized_events n
             JOIN events e ON n.event_id = e.event_id
             WHERE e.dataset_id = ? AND n.rule_id IS NOT NULL
-        """, [dataset_id]).fetchall()
+        """, [dataset_id])
 
-        for row in embedded_rows:
-            (eid, seq, ts, host, user, sev, rid, rname, tid, tnm, tac,
-             pname, parent, domain, reg, fpath, cat, act) = row
-            
-            seen_event_rules.add((eid, rid))
-            ctx = {
-                "process_name": pname,
-                "parent_name": parent,
-                "destination_domain": domain,
-                "registry_path": reg,
-                "file_path": fpath,
-                "event_category": cat,
-                "event_action": act,
-                "source": "embedded_detector",
-            }
-            detections.append({
-                "detection_id": str(uuid.uuid4()),
-                "rule_id": rid,
-                "rule_name": rname or (self.rules.get(rid).name if rid in self.rules else "Security Alert"),
-                "event_id": eid,
-                "dataset_id": dataset_id,
-                "seq_num": seq,
-                "timestamp_utc": ts,
-                "host_name": host,
-                "user_name": user,
-                "severity": int(sev or 5),
-                "mitre_technique_id": tid or (self.rules.get(rid).mitre_technique_id if rid in self.rules else "T1000"),
-                "mitre_technique_name": tnm or (self.rules.get(rid).mitre_technique_name if rid in self.rules else "Unknown"),
-                "mitre_tactic": tac or (self.rules.get(rid).mitre_tactic if rid in self.rules else "Unknown"),
-                "match_context": json.dumps(ctx),
-                "false_positive_risk": "LOW",
-            })
+        # Track existing (event_id, rule_id) pairs to avoid duplicates with heuristic rules
+        seen_pairs = conn.execute("SELECT event_id, rule_id FROM detections WHERE dataset_id = ?", [dataset_id]).fetchall()
+        seen_event_rules: set[Tuple[str, str]] = set((r[0], r[1]) for r in seen_pairs)
+
+        detections: List[Dict[str, Any]] = []
 
         # 2. Heuristic Rule: Office spawning scripting engine (5cb93fae / T1059.001)
         office_rows = conn.execute("""
@@ -364,10 +343,7 @@ class DetectionEngine:
                 "false_positive_risk": "LOW",
             })
 
-        # Batch insert detections into DuckDB
-        conn.execute("DELETE FROM incident_detections WHERE detection_id IN (SELECT detection_id FROM detections WHERE dataset_id = ?)", [dataset_id])
-        conn.execute("DELETE FROM detection_evidence WHERE detection_id IN (SELECT detection_id FROM detections WHERE dataset_id = ?)", [dataset_id])
-        conn.execute("DELETE FROM detections WHERE dataset_id = ?", [dataset_id])
+        # Batch insert additional heuristic detections into DuckDB
         if detections:
             data = [
                 (
@@ -385,22 +361,22 @@ class DetectionEngine:
         conn.commit()
 
         elapsed = time.perf_counter() - t0
+        total_detections_cnt = conn.execute("SELECT count(*) FROM detections WHERE dataset_id = ?", [dataset_id]).fetchone()[0]
 
         summary = {
             "dataset_id": dataset_id,
-            "total_detections": len(detections),
+            "total_detections": total_detections_cnt,
             "rules_evaluated": len(self.rules),
             "elapsed_seconds": round(elapsed, 3),
             "detections_by_rule": {},
             "detections_by_tactic": {},
             "detections_by_severity": {},
         }
-        for d in detections:
-            r = d["rule_name"]
-            t = d["mitre_tactic"]
-            s = str(d["severity"])
-            summary["detections_by_rule"][r] = summary["detections_by_rule"].get(r, 0) + 1
-            summary["detections_by_tactic"][t] = summary["detections_by_tactic"].get(t, 0) + 1
-            summary["detections_by_severity"][s] = summary["detections_by_severity"].get(s, 0) + 1
+        for r, cnt in conn.execute("SELECT rule_name, count(*) FROM detections WHERE dataset_id = ? GROUP BY rule_name", [dataset_id]).fetchall():
+            summary["detections_by_rule"][r] = cnt
+        for t, cnt in conn.execute("SELECT tactic_name, count(*) FROM detections WHERE dataset_id = ? GROUP BY tactic_name", [dataset_id]).fetchall():
+            summary["detections_by_tactic"][t] = cnt
+        for s, cnt in conn.execute("SELECT severity, count(*) FROM detections WHERE dataset_id = ? GROUP BY severity", [dataset_id]).fetchall():
+            summary["detections_by_severity"][str(s)] = cnt
 
         return summary

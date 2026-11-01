@@ -387,6 +387,11 @@ def process_uploaded_log(
                 raw_json = json.dumps(kv)
             else:
                 raw_json = json.dumps({"raw": line_str})
+                mapped = _map_mitre_from_attack("", line_str)
+                if mapped:
+                    tech_id, tactic, tech_nm, severity = mapped
+                    rule_id = f"rule-{hashlib.md5(line_str.encode()).hexdigest()[:8]}"
+                    rule_name = tech_nm
 
             # Live In-Flight Threat Interception
             if tech_id or (severity and severity >= 6) or atk:
@@ -464,7 +469,7 @@ def process_uploaded_log(
         norm_rows.clear()
 
     # Update dataset status
-    conn.execute("UPDATE datasets SET status = 'registered', updated_at = NOW() WHERE dataset_id = ?", [dataset_id])
+    conn.execute("UPDATE datasets SET status = 'ingested', updated_at = NOW() WHERE dataset_id = ?", [dataset_id])
 
     # Run Detection Engine on new dataset
     _notify_progress(progress_callback, seq, "Evaluating MITRE ATT&CK detection rules...")
