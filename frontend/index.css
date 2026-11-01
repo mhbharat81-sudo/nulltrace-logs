@@ -1817,3 +1817,159 @@ body {
   color: #64748b;
   border: 1px solid #cbd5e1;
 }
+
+/* ── In-Flight Threat Interception Live UI ───────────────────────────── */
+.header-inflight-pill {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  color: #f1f5f9;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.header-inflight-pill:hover {
+  background: #1e293b;
+  border-color: #ef4444;
+}
+
+.header-radar-dot {
+  width: 8px;
+  height: 8px;
+  background-color: #10b981;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 6px #10b981;
+  animation: radar-blink 1.2s infinite ease-in-out;
+}
+
+.header-radar-dot.intercepting {
+  background-color: #ef4444 !important;
+  box-shadow: 0 0 8px #ef4444 !important;
+}
+
+@keyframes radar-blink {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.8); }
+}
+
+.inflight-radar-pulse {
+  width: 10px;
+  height: 10px;
+  background-color: #ef4444;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 10px #ef4444;
+  animation: radar-pulse-anim 1s infinite;
+}
+
+@keyframes radar-pulse-anim {
+  0% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+  70% { transform: scale(1.1); box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+  100% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+.badge-status-glow {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+  border: 1px solid #ef4444;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.threat-entry {
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid #334155;
+  border-left: 3px solid #ef4444;
+  border-radius: 5px;
+  padding: 7px 9px;
+  margin-bottom: 6px;
+  animation: threat-slide-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: all 0.2s ease;
+}
+
+.threat-entry:hover {
+  background: rgba(30, 41, 59, 0.9);
+  border-color: #475569;
+}
+
+.threat-entry.sev-critical {
+  border-left-color: #ef4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.15);
+}
+
+.threat-entry.sev-high {
+  border-left-color: #f59e0b;
+}
+
+@keyframes threat-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.threat-badge-tech {
+  background: #1e1b4b;
+  color: #a5b4fc;
+  border: 1px solid #4338ca;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9.5px;
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+.threat-badge-sev {
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9.5px;
+  font-weight: 800;
+  margin-left: auto;
+}
+
+.threat-badge-sev.sev-critical {
+  background: #7f1d1d;
+  color: #fecaca;
+  border: 1px solid #dc2626;
+}
+
+.threat-badge-sev.sev-high {
+  background: #78350f;
+  color: #fef3c7;
+  border: 1px solid #d97706;
+}
+
+.threat-badge-sev.sev-med {
+  background: #1e3a8a;
+  color: #dbeafe;
+  border: 1px solid #2563eb;
+}
+
+.threat-badge-mitigation {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(16, 185, 129, 0.15);
+  color: #6ee7b7;
+  border: 1px solid #059669;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9.5px;
+  font-weight: 600;
+}

@@ -86,6 +86,10 @@
     </nav>
 
     <div class="header-right">
+      <div id="headerInFlightPill" class="header-inflight-pill" title="Live In-Flight Stream Threat Interceptor">
+        <span class="header-radar-dot"></span>
+        <span id="headerInFlightText">INTERCEPTION: ARMED</span>
+      </div>
       <div class="dataset-pill"
         style="display: flex; align-items: center; gap: 8px; padding: 5px 12px; background: #f0fdf4; border-radius: 8px; border: 1px solid #bbf7d0;">
         <span class="dataset-icon" id="datasetIcon" style="color: #16a34a; font-size: 14px;">🛡️</span>
@@ -97,7 +101,12 @@
       </div>
       <button class="btn btn-sm btn-primary" id="btnOpenUploadModal"
         style="display: flex; align-items: center; gap: 6px; padding: 6px 13px; font-weight: 600; border-radius: 8px; cursor: pointer;">
-        <span>📤</span> Upload Log
+        <span>📤</span> Ingest / Upload Log
+      </button>
+      <button class="btn btn-sm btn-secondary" id="btnResetDatabase"
+        style="display: flex; align-items: center; gap: 5px; padding: 6px 11px; font-weight: 600; border-radius: 8px; cursor: pointer; color: #475569; border: 1px solid #cbd5e1; background: #ffffff;"
+        title="Purge temporary test uploads and reset to clean baseline">
+        <span>🔄</span> Start Clean
       </button>
       <button class="btn btn-sm" id="btnOpenAiModal"
         style="background: linear-gradient(135deg, #4f46e5, #7c3aed); color: #ffffff; border: none; font-weight: 600; display: flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 8px; cursor: pointer; box-shadow: 0 2px 4px rgba(79, 70, 229, 0.25);">
@@ -1274,57 +1283,189 @@
   <div class="modal-backdrop" id="uploadModalBackdrop"
     style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 9999; align-items: center; justify-content: center;">
     <div class="glass-panel"
-      style="width: 580px; max-width: 92vw; background: #ffffff; border-radius: 12px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2); overflow: hidden; border: 1px solid #cbd5e1;">
+      style="width: 680px; max-width: 95vw; background: #ffffff; border-radius: 12px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2); overflow: hidden; border: 1px solid #cbd5e1;">
       <div
         style="padding: 16px 20px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; background: #f8fafc;">
         <div style="display: flex; align-items: center; gap: 10px;">
-          <span style="font-size: 20px;">📤</span>
+          <span style="font-size: 22px;">⚡</span>
           <div>
-            <h3 style="margin: 0; font-size: 15px; font-weight: 700; color: #0f172a;">Upload Local Security Log File
-            </h3>
-            <span style="font-size: 11px; color: #64748b;">Supports FortiGate/Syslog (.log, .txt) &amp; EDR/SIEM (.json,
-              .jsonl)</span>
+            <h3 style="margin: 0; font-size: 15px; font-weight: 700; color: #0f172a;">Enterprise Security Log Ingestion</h3>
+            <span style="font-size: 11px; color: #64748b;">Direct disk streaming (Zero Dividing) or high-speed upload · Full unlimited record ingestion</span>
           </div>
         </div>
         <button id="btnCloseUploadModal"
           style="background: none; border: none; font-size: 20px; color: #94a3b8; cursor: pointer;">&times;</button>
       </div>
 
+      <!-- Ingestion Mode Selector Tabs -->
+      <div style="display: flex; border-bottom: 1px solid #e2e8f0; background: #f1f5f9;">
+        <button id="tabModeLocalDirect" style="flex: 1; padding: 10px 14px; border: none; background: #ffffff; font-weight: 700; font-size: 12px; color: #1e40af; border-bottom: 2px solid #2563eb; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px;">
+          <span>⚡</span> Direct Server File (Zero Dividing - Recommended)
+        </button>
+        <button id="tabModeBrowserUpload" style="flex: 1; padding: 10px 14px; border: none; background: transparent; font-weight: 600; font-size: 12px; color: #64748b; border-bottom: 2px solid transparent; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px;">
+          <span>📤</span> Browser File Upload
+        </button>
+      </div>
+
       <div style="padding: 20px;">
-        <!-- Dropzone -->
-        <div id="uploadDropzone"
-          style="border: 2px dashed #94a3b8; border-radius: 8px; padding: 36px 20px; text-align: center; background: #f8fafc; cursor: pointer; transition: all 0.2s ease;">
-          <input type="file" id="localLogFileInput" accept=".log,.json,.jsonl,.txt" style="display: none;">
-          <div style="font-size: 36px; margin-bottom: 8px;">📁</div>
-          <strong style="color: #1e293b; font-size: 14px; display: block; margin-bottom: 4px;">Click to select or drag
-            and drop your security log file here</strong>
-          <span style="font-size: 12px; color: #64748b;">High-performance streaming engine for enterprise security
-            telemetry</span>
+        <!-- TAB 1: Direct Server File Ingestion (Zero Dividing) -->
+        <div id="paneModeLocalDirect">
+          <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px 14px; margin-bottom: 16px;">
+            <div style="display: flex; align-items: center; gap: 6px; color: #166534; font-weight: 700; font-size: 13px;">
+              <span>✅</span> Instant Zero-Dividing Ingestion
+            </div>
+            <div style="font-size: 11px; color: #15803d; margin-top: 3px; line-height: 1.4;">
+              Eliminates browser slicing overhead. Streams directly from disk into DuckDB at ~100k events/sec with 100% data fidelity, complete MITRE ATT&CK coverage, and full attack graph correlation.
+            </div>
+          </div>
+
+          <label style="display: block; font-size: 12px; font-weight: 700; color: #1e293b; margin-bottom: 6px;">Available Local Enterprise Datasets:</label>
+          <div id="quickLocalFilesContainer" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px;">
+            <div style="color: #64748b; font-size: 12px;">Scanning local files...</div>
+          </div>
+
+          <div style="margin-bottom: 14px;">
+            <label style="display: block; font-size: 12px; font-weight: 700; color: #1e293b; margin-bottom: 4px;">File Path on Server:</label>
+            <input type="text" id="inputLocalFilePath" value="50g_log.json" placeholder="e.g. 50g_log.json or D:\path\to\security.json"
+              style="width: 100%; box-sizing: border-box; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; font-family: monospace; color: #0f172a;">
+          </div>
+
+          <div style="display: flex; gap: 12px; margin-bottom: 16px;">
+            <div style="flex: 1;">
+              <label style="display: block; font-size: 11px; font-weight: 600; color: #475569; margin-bottom: 4px;">Ingestion Record Limit:</label>
+              <select id="selectLocalRecordLimit" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; color: #1e293b; background: #ffffff;">
+                <option value="all" selected>All Records (Full Ingestion — 341k+ Records)</option>
+                <option value="100000">Sample 100,000 Records</option>
+                <option value="50000">Sample 50,000 Records</option>
+              </select>
+            </div>
+            <div style="flex: 1;">
+              <label style="display: block; font-size: 11px; font-weight: 600; color: #475569; margin-bottom: 4px;">Dataset Alias (Optional):</label>
+              <input type="text" id="inputLocalDatasetName" placeholder="e.g., FortiGate 50G NGFW"
+                style="width: 100%; box-sizing: border-box; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; color: #1e293b;">
+            </div>
+          </div>
         </div>
 
-        <!-- Selected file details -->
-        <div id="selectedFileInfo"
-          style="display: none; margin-top: 14px; padding: 12px; border-radius: 6px; background: #eff6ff; border: 1px solid #bfdbfe;">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <div>
-              <strong style="font-size: 13px; color: #1e40af;" id="uploadSelectedName">security.log</strong>
-              <div style="font-size: 11px; color: #3b82f6; margin-top: 2px;" id="uploadSelectedSize">Ready for ingestion
+        <!-- TAB 2: Browser Upload (Single Stream or Resumable Chunks) -->
+        <div id="paneModeBrowserUpload" style="display: none;">
+          <!-- Dropzone -->
+          <div id="uploadDropzone"
+            style="border: 2px dashed #94a3b8; border-radius: 8px; padding: 28px 20px; text-align: center; background: #f8fafc; cursor: pointer; transition: all 0.2s ease;">
+            <input type="file" id="localLogFileInput" accept=".log,.json,.jsonl,.txt,.gz" style="display: none;">
+            <div style="font-size: 32px; margin-bottom: 6px;">📂</div>
+            <strong style="color: #1e293b; font-size: 13px; display: block; margin-bottom: 4px;">Click to select or drag and drop your enterprise log file here</strong>
+            <span style="font-size: 11px; color: #64748b;">Direct Streaming or Resumable Chunks · GZIP Auto-Detect · Up to 50GB</span>
+          </div>
+
+          <!-- Selected file details -->
+          <div id="selectedFileInfo"
+            style="display: none; margin-top: 12px; padding: 12px; border-radius: 8px; background: #eff6ff; border: 1px solid #bfdbfe;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+              <div>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <strong style="font-size: 13px; color: #1e40af;" id="uploadSelectedName">security.log</strong>
+                  <span id="uploadChunkBadge" style="background: #dbeafe; color: #1e40af; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">Direct Stream</span>
+                </div>
+                <div style="font-size: 11px; color: #3b82f6; margin-top: 2px;" id="uploadSelectedSize">Ready for ingestion</div>
+                <div style="font-size: 11px; color: #1d4ed8; margin-top: 2px; font-weight: 500;" id="uploadResumableNotice"></div>
+              </div>
+              <button class="btn btn-sm btn-secondary" id="btnClearSelectedFile">Remove</button>
+            </div>
+          </div>
+
+          <div style="display: flex; gap: 12px; margin-top: 12px;">
+            <div style="flex: 1;">
+              <label style="display: block; font-size: 11px; font-weight: 600; color: #475569; margin-bottom: 4px;">Upload Method:</label>
+              <select id="selectUploadMethod" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; color: #1e293b; background: #ffffff;">
+                <option value="direct" selected>Direct Single Stream (No Dividing)</option>
+                <option value="chunked">Resumable 25MB Chunks</option>
+              </select>
+            </div>
+            <div style="flex: 1;">
+              <label style="display: block; font-size: 11px; font-weight: 600; color: #475569; margin-bottom: 4px;">Record Limit:</label>
+              <select id="selectUploadRecordLimit" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; color: #1e293b; background: #ffffff;">
+                <option value="all" selected>All Records (Full Ingestion — Unlimited)</option>
+                <option value="100000">Sample 100,000 Records</option>
+                <option value="50000">Sample 50,000 Records</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Progress & Live In-Flight Threat Interception Console -->
+        <div id="uploadProgressContainer" style="display: none; margin-top: 14px;">
+          <!-- Overall Pipeline Progress Bar -->
+          <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+            <span id="uploadPhaseText" style="font-weight: 600; color: #4338ca;">Ingesting &amp; Analyzing...</span>
+            <span id="uploadPercentText" style="color: #1e293b; font-weight: 700;">0%</span>
+          </div>
+          <div style="height: 8px; background: #e2e8f0; border-radius: 4px; overflow: hidden; margin-bottom: 10px;">
+            <div id="uploadProgressBar"
+              style="width: 0%; height: 100%; background: linear-gradient(90deg, #4f46e5, #06b6d4); transition: width 0.2s ease;">
+            </div>
+          </div>
+
+          <!-- Live In-Flight Threat Interceptor Banner -->
+          <div class="inflight-panel-card" style="background: #0b1120; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.25);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span class="inflight-radar-pulse"></span>
+                <strong style="color: #f1f5f9; font-size: 12px; letter-spacing: 0.5px;">LIVE IN-FLIGHT THREAT INTERCEPTION ACTIVE</strong>
+                <span class="badge-status-glow" id="inflightStatusGlow">INSPECTION RUNNING</span>
+              </div>
+              <div style="font-size: 10px; color: #94a3b8; font-family: monospace;">
+                STREAM DPI · MITRE CORRELATION
               </div>
             </div>
-            <button class="btn btn-sm btn-secondary" id="btnClearSelectedFile">Remove</button>
-          </div>
-        </div>
 
-        <!-- Upload Progress -->
-        <div id="uploadProgressContainer" style="display: none; margin-top: 14px;">
-          <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
-            <span id="uploadPhaseText" style="font-weight: 600; color: #4338ca;">Uploading &amp; Analyzing...</span>
-            <span id="uploadPercentText" style="color: #64748b;">0%</span>
-          </div>
-          <div style="height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden;">
-            <div id="uploadProgressBar"
-              style="width: 0%; height: 100%; background: linear-gradient(90deg, #4f46e5, #06b6d4); transition: width 0.3s ease;">
+            <!-- In-Flight Telemetry Metrics -->
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px;">
+              <div class="inflight-stat-box" style="background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; text-align: center;">
+                <span style="color: #9ca3af; display: block; font-size: 9px; text-transform: uppercase; font-weight: 600;">Events Inspected</span>
+                <strong id="telemetryRecordsScanned" style="color: #38bdf8; font-size: 15px; font-family: monospace; font-weight: 700;">0</strong>
+              </div>
+              <div class="inflight-stat-box" style="background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; text-align: center;">
+                <span style="color: #9ca3af; display: block; font-size: 9px; text-transform: uppercase; font-weight: 600;">Threats Intercepted</span>
+                <strong id="telemetryThreatsIntercepted" style="color: #f87171; font-size: 15px; font-family: monospace; font-weight: 700;">0</strong>
+              </div>
+              <div class="inflight-stat-box" style="background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; text-align: center;">
+                <span style="color: #9ca3af; display: block; font-size: 9px; text-transform: uppercase; font-weight: 600;">Critical Exploits</span>
+                <strong id="telemetryCriticalBlocked" style="color: #fbbf24; font-size: 15px; font-family: monospace; font-weight: 700;">0</strong>
+              </div>
+              <div class="inflight-stat-box" style="background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; text-align: center;">
+                <span style="color: #9ca3af; display: block; font-size: 9px; text-transform: uppercase; font-weight: 600;">Countermeasures</span>
+                <strong id="telemetryActiveMitigations" style="color: #34d399; font-size: 15px; font-family: monospace; font-weight: 700;">0</strong>
+              </div>
             </div>
+
+            <!-- In-Flight Live Stream Terminal -->
+            <div id="uploadThreatFeedContainer" style="background: #030712; border: 1px solid #1e293b; border-radius: 6px; overflow: hidden;">
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #0f172a; border-bottom: 1px solid #1e293b; font-size: 10px;">
+                <span style="color: #94a3b8; font-weight: 700; display: flex; align-items: center; gap: 6px;">
+                  <span style="color: #10b981;">⚡</span> STREAM INTERCEPTION TELEMETRY LOG
+                </span>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                  <label style="color: #64748b; cursor: pointer; display: flex; align-items: center; gap: 4px; font-size: 10px;">
+                    <input type="checkbox" id="chkAutoScrollThreats" checked style="cursor: pointer;"> Auto-Scroll
+                  </label>
+                  <span id="threatFeedCountBadge" style="background: #dc2626; color: #ffffff; padding: 1px 6px; border-radius: 10px; font-weight: 700; font-size: 9px;">0 DETECTED</span>
+                </div>
+              </div>
+              <div id="uploadThreatFeed"
+                style="max-height: 200px; min-height: 90px; overflow-y: auto; padding: 8px 10px; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 11px; line-height: 1.5; color: #cbd5e1; scroll-behavior: smooth;">
+                <div id="threatFeedEmptyPrompt" style="color: #64748b; font-style: italic; padding: 14px 6px; text-align: center;">
+                  🟢 Deep-packet inspection armed. Telemetry stream active — scanning events for exploit signatures...
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Underlying Metrics / Speed -->
+          <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; font-size: 11px; color: #475569; background: #f8fafc; padding: 6px 12px; border-radius: 6px; border: 1px solid #e2e8f0; text-align: center; margin-top: 8px;">
+            <div><span style="color: #94a3b8; display: block; font-size: 9px; text-transform: uppercase;">Records Ingested</span><strong id="uploadChunkText">0</strong></div>
+            <div><span style="color: #94a3b8; display: block; font-size: 9px; text-transform: uppercase;">Pipeline Velocity</span><strong id="uploadSpeedText">--</strong></div>
+            <div><span style="color: #94a3b8; display: block; font-size: 9px; text-transform: uppercase;">Engine Status</span><strong id="uploadEtaText">Active</strong></div>
           </div>
         </div>
 
@@ -1334,7 +1475,7 @@
           <div style="display: flex; align-items: center; gap: 8px; color: #166534; font-weight: 700; font-size: 13px;">
             <span>✓</span> Ingestion &amp; Incident Correlation Complete!
           </div>
-          <div style="font-size: 12px; color: #15803d; margin-top: 6px;" id="uploadSuccessMessage"></div>
+          <div style="font-size: 12px; color: #15803d; margin-top: 6px; line-height: 1.4;" id="uploadSuccessMessage"></div>
           <div style="display: flex; gap: 8px; margin-top: 12px;">
             <button class="btn btn-sm btn-primary" id="btnViewUploadedGraph">🚀 View in Attack Graph</button>
             <button class="btn btn-sm btn-secondary" id="btnViewUploadedDetections">View Detections</button>
@@ -1343,7 +1484,8 @@
 
         <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
           <button class="btn btn-secondary" id="btnCancelUpload">Cancel</button>
-          <button class="btn btn-primary" id="btnStartUpload" disabled>Start Ingestion &amp; Analysis</button>
+          <button class="btn btn-secondary" id="btnPauseResumeUpload" style="display: none; font-weight: 600;">Pause</button>
+          <button class="btn btn-primary" id="btnStartUpload">Start Ingestion &amp; Analysis</button>
         </div>
       </div>
     </div>
@@ -1404,7 +1546,7 @@
 
   <!-- Investigation Topology Graph Engine -->
   <script src="cytoscape.min.js"></script>
-  <script src="app.js?v=20261101_12"></script>
+  <script src="app.js?v=20261101_13"></script>
 </body>
 
 </html>

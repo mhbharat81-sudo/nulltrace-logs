@@ -79,6 +79,25 @@ class GraphWebSocketManager:
         for conn in disconnected:
             self.disconnect(conn)
 
+    async def broadcast_threat_intercept(self, upload_id: str, threat: Dict[str, Any]) -> None:
+        """Broadcast in-flight intercepted threat to connected SOC clients in real time."""
+        self.sequence_id += 1
+        payload = {
+            "type": "in_flight_threat_intercept",
+            "upload_id": upload_id,
+            "sequence_id": self.sequence_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "threat": threat,
+        }
+        disconnected: List[WebSocket] = []
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(payload)
+            except Exception:
+                disconnected.append(connection)
+        for conn in disconnected:
+            self.disconnect(conn)
+
     async def send_heartbeat(self) -> None:
         """Periodic heartbeat ping to all connected clients."""
         payload = {

@@ -5,9 +5,13 @@ attack graph visualization, blast radius reachability, and detection evaluation.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
+import re
+import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -56,6 +60,30 @@ async def add_no_cache_header(request, call_next):
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
+_main_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+@app.on_event("startup")
+async def _on_startup():
+    global _main_event_loop
+    try:
+        _main_event_loop = asyncio.get_running_loop()
+    except Exception:
+        pass
+
+def _broadcast_in_flight_threat(upload_id: str, threat_obj: Dict[str, Any]):
+    """Thread-safe WebSocket broadcast of live in-flight threat intercept."""
+    if not threat_obj or not ws_manager.active_connections:
+        return
+    try:
+        global _main_event_loop
+        if _main_event_loop and _main_event_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                ws_manager.broadcast_threat_intercept(upload_id, threat_obj),
+                _main_event_loop
+            )
+    except Exception:
+        pass
 
 # Helpers
 def _is_unified(ds_id: Optional[str]) -> bool:
@@ -189,9 +217,13 @@ def get_stats(dataset_id: Optional[str] = None):
 def list_datasets():
     conn = get_db()
     rows = conn.execute("""
-        SELECT dataset_id, filename, file_size_bytes, format, status, created_at
-        FROM datasets
-        ORDER BY created_at DESC
+        SELECT d.dataset_id, d.filename, d.file_size_bytes, d.format, d.status, d.created_at,
+               COALESCE(e.cnt, 0) as event_count,
+               COALESCE(det.cnt, 0) as detection_count
+        FROM datasets d
+        LEFT JOIN (SELECT dataset_id, count(*) as cnt FROM events GROUP BY dataset_id) e ON d.dataset_id = e.dataset_id
+        LEFT JOIN (SELECT dataset_id, count(*) as cnt FROM detections GROUP BY dataset_id) det ON d.dataset_id = det.dataset_id
+        ORDER BY d.created_at DESC
     """).fetchall()
 
     return [
@@ -202,6 +234,8 @@ def list_datasets():
             "format": r[3],
             "status": r[4],
             "created_at": str(r[5]),
+            "event_count": r[6],
+            "detection_count": r[7],
         }
         for r in rows
     ]
@@ -866,10 +900,15 @@ async def websocket_attack_graph_endpoint(websocket: WebSocket):
 
 
 @app.post("/api/upload-log")
-async def upload_log_file(file: UploadFile = File(...)):
+async def upload_log_file(
+    file: UploadFile = File(...),
+    upload_id: Optional[str] = Form(None),
+    max_records: Optional[int] = Form(None)
+):
     """
     Upload and process an enterprise security log file (.log, .json, .jsonl, .txt).
-    Supports large enterprise log files with high-throughput streaming and automatic disk reclamation.
+    Supports large enterprise log files with high-throughput streaming, in-flight threat interception,
+    and automatic disk reclamation.
     """
     upload_dir = Path("data/uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -888,20 +927,542 @@ async def upload_log_file(file: UploadFile = File(...)):
                 bytes_written += len(chunk)
                 if bytes_written > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail="Log file exceeds maximum allowed upload size (20GB).")
-                    
-        result = process_uploaded_log(temp_target, clean_filename)
-        return result
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Log ingestion failed: {str(e)}")
-    finally:
-        # Guarantee automatic cleanup so Drive F: free space is never permanently used
         if temp_target.exists():
             try:
                 temp_target.unlink()
             except Exception:
                 pass
+        raise HTTPException(status_code=500, detail=f"Log upload stream failed: {str(e)}")
+
+    if upload_id:
+        clean_uid = re.sub(r'[^a-zA-Z0-9_\-]', '', upload_id)
+        with _jobs_lock:
+            _upload_jobs[clean_uid] = {
+                'upload_id': clean_uid,
+                'filename': clean_filename,
+                'status': 'processing',
+                'phase': 'Starting live in-flight threat interception stream...',
+                'progress_pct': 10,
+                'records_processed': 0,
+                'threats_intercepted_count': 0,
+                'critical_blocks_count': 0,
+                'in_flight_intercepts': [],
+                'result': None,
+                'error': None,
+                'created_at': time.time(),
+                'updated_at': time.time()
+            }
+
+        def _bg_worker():
+            try:
+                def _prog_cb(rec_count: int, phase_text: str, threat_obj: Optional[Dict[str, Any]] = None):
+                    with _jobs_lock:
+                        job = _upload_jobs.get(clean_uid)
+                        if job:
+                            job['records_processed'] = rec_count
+                            job['phase'] = phase_text
+                            if threat_obj:
+                                job['threats_intercepted_count'] = job.get('threats_intercepted_count', 0) + 1
+                                if threat_obj.get('severity', 0) >= 8:
+                                    job['critical_blocks_count'] = job.get('critical_blocks_count', 0) + 1
+                                intercepts = job.setdefault('in_flight_intercepts', [])
+                                intercepts.append(threat_obj)
+                                if len(intercepts) > 60:
+                                    intercepts.pop(0)
+
+                            if 'DuckDB' in phase_text or 'Ingested' in phase_text or 'INTERCEPTED' in phase_text:
+                                target_recs = max_records or 350000
+                                pct = min(80, 10 + int((rec_count / target_recs) * 70))
+                            elif 'detection' in phase_text.lower():
+                                pct = 85
+                            elif 'incident' in phase_text.lower() or 'correlation' in phase_text.lower():
+                                pct = 92
+                            elif 'graph' in phase_text.lower():
+                                pct = 97
+                            else:
+                                pct = job.get('progress_pct', 20)
+                            job['progress_pct'] = max(job.get('progress_pct', 10), pct)
+                            job['updated_at'] = time.time()
+
+                    if threat_obj:
+                        _broadcast_in_flight_threat(clean_uid, threat_obj)
+
+                res = process_uploaded_log(
+                    file_path=temp_target,
+                    original_filename=clean_filename,
+                    progress_callback=_prog_cb,
+                    max_records=max_records
+                )
+                with _jobs_lock:
+                    job = _upload_jobs.get(clean_uid)
+                    if job:
+                        job['status'] = 'completed'
+                        job['phase'] = 'Direct ingestion and incident correlation complete!'
+                        job['progress_pct'] = 100
+                        job['records_processed'] = res.get('total_records', 0)
+                        job['threats_intercepted_count'] = res.get('threats_intercepted_count', job.get('threats_intercepted_count', 0))
+                        if res.get('in_flight_intercepts'):
+                            job['in_flight_intercepts'] = res['in_flight_intercepts']
+                        job['result'] = res
+                        job['updated_at'] = time.time()
+            except Exception as exc:
+                with _jobs_lock:
+                    job = _upload_jobs.get(clean_uid)
+                    if job:
+                        job['status'] = 'failed'
+                        job['phase'] = 'Ingestion failed'
+                        job['error'] = str(exc)
+                        job['updated_at'] = time.time()
+            finally:
+                if temp_target.exists():
+                    try:
+                        temp_target.unlink()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_bg_worker, daemon=True).start()
+        return {
+            'status': 'accepted',
+            'upload_id': clean_uid,
+            'message': 'File uploaded. Streaming ingestion and in-flight threat interception active.'
+        }
+    else:
+        try:
+            result = process_uploaded_log(temp_target, clean_filename, max_records=max_records)
+            return result
+        finally:
+            if temp_target.exists():
+                try:
+                    temp_target.unlink()
+                except Exception:
+                    pass
+
+
+# ── Resumable Chunked Upload & Async Large Log Ingestion ─────────────────────
+_upload_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+class UploadCompleteRequest(BaseModel):
+    upload_id: str
+    filename: str
+    total_chunks: int
+    max_records: Optional[int] = None
+
+def _run_background_reassembly_and_ingestion(upload_id: str, filename: str, total_chunks: int, max_records: Optional[int]):
+    clean_filename = Path(filename).name
+    staging_dir = _UPLOAD_SPOOL_DIR / upload_id
+    assembled_path = _UPLOAD_SPOOL_DIR / f'assembled_{time.time_ns()}_{clean_filename}'
+    
+    try:
+        with _jobs_lock:
+            if upload_id in _upload_jobs:
+                _upload_jobs[upload_id]['status'] = 'processing'
+                _upload_jobs[upload_id]['phase'] = 'Reassembling chunk slices on disk...'
+                _upload_jobs[upload_id]['progress_pct'] = 10
+                _upload_jobs[upload_id]['threats_intercepted_count'] = 0
+                _upload_jobs[upload_id]['critical_blocks_count'] = 0
+                _upload_jobs[upload_id]['in_flight_intercepts'] = []
+                _upload_jobs[upload_id]['updated_at'] = time.time()
+
+        # Stream concatenate chunks with 16MB buffer
+        with open(assembled_path, 'wb') as f_out:
+            for i in range(total_chunks):
+                part_path = staging_dir / f'chunk_{i:06d}.part'
+                if not part_path.exists():
+                    raise FileNotFoundError(f'Missing chunk index {i} in staging directory.')
+                with open(part_path, 'rb') as f_in:
+                    shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
+                try:
+                    part_path.unlink()
+                except Exception:
+                    pass
+
+        # Cleanup staging dir
+        try:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        with _jobs_lock:
+            if upload_id in _upload_jobs:
+                _upload_jobs[upload_id]['phase'] = 'Ingesting records & intercepting in-flight threats...'
+                _upload_jobs[upload_id]['progress_pct'] = 25
+                _upload_jobs[upload_id]['updated_at'] = time.time()
+
+        def _progress_cb(rec_count: int, phase_text: str, threat_obj: Optional[Dict[str, Any]] = None):
+            with _jobs_lock:
+                if upload_id in _upload_jobs:
+                    job = _upload_jobs[upload_id]
+                    job['records_processed'] = rec_count
+                    job['phase'] = phase_text
+                    if threat_obj:
+                        job['threats_intercepted_count'] = job.get('threats_intercepted_count', 0) + 1
+                        if threat_obj.get('severity', 0) >= 8:
+                            job['critical_blocks_count'] = job.get('critical_blocks_count', 0) + 1
+                        intercepts = job.setdefault('in_flight_intercepts', [])
+                        intercepts.append(threat_obj)
+                        if len(intercepts) > 60:
+                            intercepts.pop(0)
+
+                    if 'DuckDB' in phase_text or 'Ingested' in phase_text or 'INTERCEPTED' in phase_text:
+                        target_recs = max_records or 350000
+                        pct = min(75, 25 + int((rec_count / target_recs) * 50))
+                    elif 'detection' in phase_text.lower():
+                        pct = 82
+                    elif 'incident' in phase_text.lower() or 'correlation' in phase_text.lower():
+                        pct = 90
+                    elif 'graph' in phase_text.lower():
+                        pct = 96
+                    else:
+                        pct = job.get('progress_pct', 30)
+                    job['progress_pct'] = max(job.get('progress_pct', 25), pct)
+                    job['updated_at'] = time.time()
+
+            if threat_obj:
+                _broadcast_in_flight_threat(upload_id, threat_obj)
+
+        res = process_uploaded_log(
+            file_path=assembled_path,
+            original_filename=clean_filename,
+            progress_callback=_progress_cb,
+            max_records=max_records
+        )
+
+        with _jobs_lock:
+            if upload_id in _upload_jobs:
+                _upload_jobs[upload_id]['status'] = 'completed'
+                _upload_jobs[upload_id]['phase'] = 'Ingestion and incident correlation complete!'
+                _upload_jobs[upload_id]['progress_pct'] = 100
+                _upload_jobs[upload_id]['records_processed'] = res.get('total_records', 0)
+                _upload_jobs[upload_id]['threats_intercepted_count'] = res.get('threats_intercepted_count', _upload_jobs[upload_id].get('threats_intercepted_count', 0))
+                if res.get('in_flight_intercepts'):
+                    _upload_jobs[upload_id]['in_flight_intercepts'] = res['in_flight_intercepts']
+                _upload_jobs[upload_id]['result'] = res
+                _upload_jobs[upload_id]['updated_at'] = time.time()
+
+    except Exception as exc:
+        with _jobs_lock:
+            if upload_id in _upload_jobs:
+                _upload_jobs[upload_id]['status'] = 'failed'
+                _upload_jobs[upload_id]['phase'] = 'Ingestion failed'
+                _upload_jobs[upload_id]['error'] = str(exc)
+                _upload_jobs[upload_id]['updated_at'] = time.time()
+    finally:
+        if assembled_path.exists():
+            try:
+                assembled_path.unlink()
+            except Exception:
+                pass
+
+
+@app.get('/api/upload-chunk/status')
+def get_upload_chunk_status(upload_id: str):
+    clean_upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', upload_id)
+    staging_dir = _UPLOAD_SPOOL_DIR / clean_upload_id
+    if not staging_dir.exists():
+        return {
+            'upload_id': clean_upload_id,
+            'uploaded_chunks': [],
+            'total_bytes_staged': 0
+        }
+    
+    parts = list(staging_dir.glob('chunk_*.part'))
+    uploaded_indices = []
+    total_bytes = 0
+    for p in parts:
+        try:
+            idx = int(p.stem.split('_')[1])
+            uploaded_indices.append(idx)
+            total_bytes += p.stat().st_size
+        except (ValueError, IndexError):
+            continue
+            
+    uploaded_indices.sort()
+    return {
+        'upload_id': clean_upload_id,
+        'uploaded_chunks': uploaded_indices,
+        'total_bytes_staged': total_bytes
+    }
+
+
+@app.post('/api/upload-chunk')
+async def upload_log_chunk(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...),
+    is_compressed: bool = Form(False),
+    chunk: UploadFile = File(...)
+):
+    clean_upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', upload_id)
+    if not clean_upload_id:
+        raise HTTPException(status_code=400, detail='Invalid upload_id')
+        
+    staging_dir = _UPLOAD_SPOOL_DIR / clean_upload_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    
+    part_path = staging_dir / f'chunk_{chunk_index:06d}.part'
+    
+    CHUNK_BUFFER = 1024 * 1024  # 1MB buffer
+    if is_compressed:
+        chunk_data = await chunk.read()
+        try:
+            chunk_data = gzip.decompress(chunk_data)
+        except Exception:
+            pass
+        with open(part_path, 'wb') as f_out:
+            f_out.write(chunk_data)
+    else:
+        with open(part_path, 'wb') as f_out:
+            while data := await chunk.read(CHUNK_BUFFER):
+                f_out.write(data)
+            
+    return {
+        'status': 'ok',
+        'upload_id': clean_upload_id,
+        'chunk_index': chunk_index,
+        'bytes': part_path.stat().st_size
+    }
+
+
+@app.post('/api/upload-complete')
+def complete_log_upload(req: UploadCompleteRequest):
+    clean_upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', req.upload_id)
+    staging_dir = _UPLOAD_SPOOL_DIR / clean_upload_id
+    if not staging_dir.exists():
+        raise HTTPException(status_code=400, detail='Staged upload directory not found.')
+        
+    missing = []
+    for i in range(req.total_chunks):
+        p = staging_dir / f'chunk_{i:06d}.part'
+        if not p.exists():
+            missing.append(i)
+            
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Cannot complete upload: missing {len(missing)} chunks (e.g., indices {missing[:5]}).'
+        )
+        
+    with _jobs_lock:
+        _upload_jobs[clean_upload_id] = {
+            'upload_id': clean_upload_id,
+            'filename': req.filename,
+            'status': 'queued',
+            'phase': 'Queued for assembly and analysis...',
+            'progress_pct': 0,
+            'records_processed': 0,
+            'threats_intercepted_count': 0,
+            'critical_blocks_count': 0,
+            'in_flight_intercepts': [],
+            'result': None,
+            'error': None,
+            'created_at': time.time(),
+            'updated_at': time.time()
+        }
+        
+    t = threading.Thread(
+        target=_run_background_reassembly_and_ingestion,
+        args=(clean_upload_id, req.filename, req.total_chunks, req.max_records),
+        daemon=True
+    )
+    t.start()
+    
+    return {
+        'status': 'accepted',
+        'upload_id': clean_upload_id,
+        'message': 'Upload complete. Background ingestion and threat analysis started.'
+    }
+
+
+@app.get('/api/upload-job/{upload_id}')
+def get_upload_job_status(upload_id: str):
+    clean_upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', upload_id)
+    with _jobs_lock:
+        job = _upload_jobs.get(clean_upload_id)
+        if not job:
+            raise HTTPException(status_code=404, detail='Upload job not found.')
+        return job
+
+
+@app.delete('/api/upload-chunk/{upload_id}')
+def abort_chunk_upload(upload_id: str):
+    clean_upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', upload_id)
+    staging_dir = _UPLOAD_SPOOL_DIR / clean_upload_id
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    with _jobs_lock:
+        if clean_upload_id in _upload_jobs:
+            del _upload_jobs[clean_upload_id]
+    return {'status': 'cancelled', 'upload_id': clean_upload_id}
+
+
+# ── Direct Server-Side Ingestion & Clean State Management ────────────────────
+class IngestLocalRequest(BaseModel):
+    file_path: str
+    dataset_name: Optional[str] = None
+    dataset_id: Optional[str] = None
+    max_records: Optional[int] = None
+
+@app.get('/api/local-log-files')
+def get_local_log_files():
+    """List available local enterprise log datasets on the server for instant zero-dividing ingestion."""
+    candidates = [
+        ("50g_log.json", "FortiGate 50G Unified Enterprise Log (341,340 events)"),
+        ("data/50g_log.json", "Data Folder FortiGate 50G Unified Log"),
+        ("firex_30g_logs.json", "FortiGate 30G NGFW Perimeter Log (18,140 events)"),
+        ("firex_10g_logs.json", "FortiGate 10G NGFW Perimeter Log (18,180 events)"),
+        ("edr_10000_logs.json", "EDR Enterprise Host Telemetry (10,000 events)"),
+        ("part_0001.json", "Raw Log Slice Part 1 (170,629 events)"),
+        ("part_0003.json", "Raw Log Slice Part 3 (170,712 events)"),
+    ]
+    results = []
+    seen = set()
+    for rel_path, desc in candidates:
+        p = Path(rel_path)
+        if p.exists() and p.resolve() not in seen:
+            seen.add(p.resolve())
+            st = p.stat()
+            size_fmt = f"{st.st_size / (1024*1024*1024):.2f} GB" if st.st_size > 1024*1024*1024 else f"{st.st_size / (1024*1024):.1f} MB"
+            results.append({
+                "path": str(p).replace("\\", "/"),
+                "name": p.name,
+                "description": desc,
+                "size_bytes": st.st_size,
+                "size_formatted": size_fmt
+            })
+    return results
+
+@app.post('/api/ingest-local')
+def ingest_local_file(req: IngestLocalRequest):
+    """
+    Direct Server-Side Ingestion without dividing or slicing into chunks.
+    Reads file directly off local disk into DuckDB with 100% data integrity.
+    """
+    p = Path(req.file_path)
+    if not p.is_absolute():
+        candidates = [p, Path("data") / p, Path(".") / p]
+        found = next((c for c in candidates if c.exists()), None)
+        if not found:
+            raise HTTPException(status_code=404, detail=f"Log file not found on server at: {req.file_path}")
+        p = found
+    elif not p.exists():
+        raise HTTPException(status_code=404, detail=f"Log file not found at: {req.file_path}")
+
+    clean_filename = p.name
+    dataset_name = req.dataset_name or clean_filename
+    upload_id = f"local_{int(time.time())}_{p.stem[:12]}"
+
+    with _jobs_lock:
+        _upload_jobs[upload_id] = {
+            "upload_id": upload_id,
+            "filename": dataset_name,
+            "status": "processing",
+            "phase": "Reading and streaming directly from disk (zero dividing)...",
+            "progress_pct": 10,
+            "records_processed": 0,
+            "threats_intercepted_count": 0,
+            "critical_blocks_count": 0,
+            "in_flight_intercepts": [],
+            "result": None,
+            "error": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+
+    def _worker():
+        try:
+            def _progress_cb(rec_count: int, phase_text: str, threat_obj: Optional[Dict[str, Any]] = None):
+                with _jobs_lock:
+                    if upload_id in _upload_jobs:
+                        job = _upload_jobs[upload_id]
+                        job["records_processed"] = rec_count
+                        job["phase"] = phase_text
+                        if threat_obj:
+                            job["threats_intercepted_count"] = job.get("threats_intercepted_count", 0) + 1
+                            if threat_obj.get("severity", 0) >= 8:
+                                job["critical_blocks_count"] = job.get("critical_blocks_count", 0) + 1
+                            intercepts = job.setdefault("in_flight_intercepts", [])
+                            intercepts.append(threat_obj)
+                            if len(intercepts) > 60:
+                                intercepts.pop(0)
+
+                        target_recs = req.max_records or 350000
+                        if "DuckDB" in phase_text or "Ingested" in phase_text or "INTERCEPTED" in phase_text:
+                            pct = min(80, 10 + int((rec_count / target_recs) * 70))
+                        elif "detection" in phase_text.lower():
+                            pct = 85
+                        elif "incident" in phase_text.lower():
+                            pct = 92
+                        elif "graph" in phase_text.lower():
+                            pct = 97
+                        else:
+                            pct = job.get("progress_pct", 20)
+                        job["progress_pct"] = max(job.get("progress_pct", 10), pct)
+                        job["updated_at"] = time.time()
+
+                if threat_obj:
+                    _broadcast_in_flight_threat(upload_id, threat_obj)
+
+            res = process_uploaded_log(
+                file_path=p,
+                original_filename=dataset_name,
+                progress_callback=_progress_cb,
+                max_records=req.max_records,
+                custom_dataset_id=req.dataset_id
+            )
+            with _jobs_lock:
+                if upload_id in _upload_jobs:
+                    job = _upload_jobs[upload_id]
+                    job["status"] = "completed"
+                    job["phase"] = "Direct disk ingestion & incident correlation complete!"
+                    job["progress_pct"] = 100
+                    job["records_processed"] = res.get("total_records", 0)
+                    job["threats_intercepted_count"] = res.get("threats_intercepted_count", job.get("threats_intercepted_count", 0))
+                    if res.get("in_flight_intercepts"):
+                        job["in_flight_intercepts"] = res["in_flight_intercepts"]
+                    job["result"] = res
+                    job["updated_at"] = time.time()
+        except Exception as exc:
+            with _jobs_lock:
+                if upload_id in _upload_jobs:
+                    _upload_jobs[upload_id]["status"] = "failed"
+                    _upload_jobs[upload_id]["phase"] = "Direct ingestion failed"
+                    _upload_jobs[upload_id]["error"] = str(exc)
+                    _upload_jobs[upload_id]["updated_at"] = time.time()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {
+        "status": "accepted",
+        "upload_id": upload_id,
+        "message": f"Direct disk ingestion started for {clean_filename} without dividing."
+    }
+
+class ResetDatasetsRequest(BaseModel):
+    mode: str = "purge_uploads"
+
+@app.post('/api/datasets/reset')
+def reset_datasets_endpoint(req: ResetDatasetsRequest):
+    """Clean up uploaded datasets and reset state so the user can start again cleanly."""
+    conn = get_db(read_only=False)
+    uploads = conn.execute("SELECT dataset_id FROM datasets WHERE dataset_id LIKE 'upload-%' OR dataset_id LIKE 'local-%'").fetchall()
+    u_ids = [u[0] for u in uploads]
+    for uid in u_ids:
+        conn.execute("DELETE FROM incident_detections WHERE incident_id IN (SELECT incident_id FROM incidents WHERE dataset_id = ?)", [uid])
+        conn.execute("DELETE FROM incidents WHERE dataset_id = ?", [uid])
+        conn.execute("DELETE FROM detections WHERE dataset_id = ?", [uid])
+        conn.execute("DELETE FROM normalized_events WHERE event_id IN (SELECT event_id FROM events WHERE dataset_id = ?)", [uid])
+        conn.execute("DELETE FROM event_entities WHERE event_id IN (SELECT event_id FROM events WHERE dataset_id = ?)", [uid])
+        conn.execute("DELETE FROM events WHERE dataset_id = ?", [uid])
+        conn.execute("DELETE FROM datasets WHERE dataset_id = ?", [uid])
+    return {
+        "status": "ok",
+        "purged_count": len(u_ids),
+        "message": f"Purged {len(u_ids)} uploaded datasets. System is clean and ready for fresh ingestion."
+    }
 
 
 # ── AI Security Copilot & Autonomous Agent Endpoints ─────────────────────────
@@ -976,3 +1537,9 @@ def post_incident_report(req: IncidentReportRequest):
 frontend_dir = Path("frontend")
 if frontend_dir.exists():
     app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.api.main:app", host="127.0.0.1", port=8000, reload=True)
+

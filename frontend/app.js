@@ -32,19 +32,53 @@ async function populateUploadedDatasets() {
     const sel = document.getElementById('datasetSelector');
     if (!sel) return;
 
-    const uploaded = datasets.filter(d => d.dataset_id && d.dataset_id.startsWith('upload-'));
-    uploaded.forEach(d => {
-      const existing = sel.querySelector(`option[value="${d.dataset_id}"]`);
-      if (!existing) {
-        const opt = document.createElement('option');
-        opt.value = d.dataset_id;
-        const sizeStr = d.file_size_bytes ? ` · ${(d.file_size_bytes / 1024).toFixed(1)} KB` : '';
-        opt.innerText = `📁 Uploaded: ${d.filename}${sizeStr}`;
-        sel.appendChild(opt);
+    const currentVal = sel.value;
+    sel.innerHTML = '';
+
+    // Calculate total events
+    const totalEvents = datasets.reduce((sum, d) => sum + (d.event_count || 0), 0);
+    const optUnified = document.createElement('option');
+    optUnified.value = 'unified-enterprise';
+    optUnified.innerText = `🛡️ Unified Enterprise Defense (${totalEvents.toLocaleString()} Events • Complete SOC Telemetry)`;
+    sel.appendChild(optUnified);
+
+    datasets.forEach(d => {
+      const opt = document.createElement('option');
+      opt.value = d.dataset_id;
+      const countStr = d.event_count ? `${d.event_count.toLocaleString()} events` : '';
+      let icon = '📊';
+      let label = d.filename;
+
+      if (d.dataset_id === 'firex-50g-ngfw' || (d.filename && d.filename.includes('50g'))) {
+        icon = '🔥';
+        label = `FortiGate 50G NGFW (${countStr || '341,340 events'})`;
+      } else if (d.dataset_id === 'firex-30g-ngfw' || (d.filename && d.filename.includes('30g'))) {
+        icon = '🌐';
+        label = `FortiGate 30G NGFW (${countStr})`;
+      } else if (d.dataset_id === 'firex-10g-ngfw' || (d.filename && d.filename.includes('10g'))) {
+        icon = '🌐';
+        label = `FortiGate 10G NGFW (${countStr})`;
+      } else if (d.filename && d.filename.includes('edr_10000')) {
+        icon = '💻';
+        label = `EDR Host Telemetry (${countStr} · MITRE Matrix)`;
+      } else if (d.dataset_id && d.dataset_id.startsWith('upload-')) {
+        icon = '📁';
+        label = `Uploaded: ${d.filename} (${countStr})`;
+      } else {
+        label = `${d.filename} (${countStr})`;
       }
+
+      opt.innerText = `${icon} ${label}`;
+      sel.appendChild(opt);
     });
+
+    if (currentVal && sel.querySelector(`option[value="${currentVal}"]`)) {
+      sel.value = currentVal;
+    } else {
+      sel.value = 'unified-enterprise';
+    }
   } catch (e) {
-    console.warn('Could not populate uploaded datasets:', e);
+    console.warn('Could not populate datasets:', e);
   }
 }
 
@@ -92,14 +126,44 @@ function switchTab(tabId) {
 
 function setupEventListeners() {
   document.getElementById('btnRefresh')?.addEventListener('click', loadAllData);
+  document.getElementById('btnResetDatabase')?.addEventListener('click', async () => {
+    if (!confirm('Start Clean / Reset? This will purge all temporary uploads and reset telemetry back to the clean baseline (FortiGate 50G NGFW, 30G, 10G, EDR 10k).')) {
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/datasets/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'purge_uploads' })
+      });
+      const data = await res.json();
+      alert(data.message || 'Reset complete!');
+      await populateUploadedDatasets();
+      const sel = document.getElementById('datasetSelector');
+      if (sel) sel.value = 'unified-enterprise';
+      loadAllData();
+    } catch (err) {
+      alert(`Reset failed: ${err.message}`);
+    }
+  });
+
   document.getElementById('datasetSelector')?.addEventListener('change', (e) => {
     state.selectedIncident = null;
     const val = e.target.value;
     const isUploaded = val && val.startsWith('upload-');
+    const is50g = val && val.includes('50g');
     const icon = document.getElementById('datasetIcon');
     if (icon) {
-      icon.innerText = isUploaded ? '📁' : '🛡️';
-      icon.style.color = isUploaded ? '#2563eb' : '#16a34a';
+      if (is50g) {
+        icon.innerText = '🔥';
+        icon.style.color = '#ef4444';
+      } else if (isUploaded) {
+        icon.innerText = '📁';
+        icon.style.color = '#2563eb';
+      } else {
+        icon.innerText = '🛡️';
+        icon.style.color = '#16a34a';
+      }
     }
     loadAllData();
   });
@@ -2053,6 +2117,8 @@ function initAttackGraphWebSocket() {
         const msg = JSON.parse(evt.data);
         if (msg.type === 'graph_delta') {
           handleIncomingGraphDelta(msg);
+        } else if (msg.type === 'in_flight_threat_intercept') {
+          renderInFlightThreat(msg.threat);
         }
       } catch (err) {
         console.warn('WS message error:', err);
@@ -2242,15 +2308,488 @@ async function loadAttackTimelineUI() {
   }
 }
 
-// ── Local Log File Upload & Analysis ─────────────────────────────────────────
+// ── Live In-Flight Threat Interception Feed & Engine ────────────────────────
+const seenThreatEventIds = new Set();
+let inFlightInterceptsCount = 0;
+let inFlightCriticalCount = 0;
+
+function resetInFlightThreatFeed() {
+  seenThreatEventIds.clear();
+  inFlightInterceptsCount = 0;
+  inFlightCriticalCount = 0;
+  const feed = document.getElementById('uploadThreatFeed');
+  if (feed) {
+    feed.innerHTML = `
+      <div id="threatFeedEmptyPrompt" style="color: #64748b; font-style: italic; padding: 14px 6px; text-align: center;">
+        🟢 Deep-packet inspection armed. Telemetry stream active — scanning events for exploit signatures...
+      </div>
+    `;
+  }
+  const recEl = document.getElementById('telemetryRecordsScanned');
+  if (recEl) recEl.innerText = '0';
+  const thEl = document.getElementById('telemetryThreatsIntercepted');
+  if (thEl) thEl.innerText = '0';
+  const crEl = document.getElementById('telemetryCriticalBlocked');
+  if (crEl) crEl.innerText = '0';
+  const mitEl = document.getElementById('telemetryActiveMitigations');
+  if (mitEl) mitEl.innerText = '0';
+  const badge = document.getElementById('threatFeedCountBadge');
+  if (badge) badge.innerText = '0 DETECTED';
+  const glow = document.getElementById('inflightStatusGlow');
+  if (glow) {
+    glow.innerText = 'INSPECTION RUNNING';
+    glow.style.background = 'rgba(239, 68, 68, 0.2)';
+    glow.style.color = '#fca5a5';
+    glow.style.borderColor = '#ef4444';
+  }
+}
+
+function renderInFlightThreat(threat) {
+  if (!threat) return;
+  const feed = document.getElementById('uploadThreatFeed');
+  if (!feed) return;
+
+  const key = threat.event_id || `${threat.seq}_${threat.technique_id}_${threat.timestamp}`;
+  if (seenThreatEventIds.has(key)) return;
+  seenThreatEventIds.add(key);
+
+  const emptyPrompt = document.getElementById('threatFeedEmptyPrompt');
+  if (emptyPrompt) emptyPrompt.remove();
+
+  inFlightInterceptsCount++;
+  if (threat.severity >= 8) inFlightCriticalCount++;
+
+  // Update counters
+  const thEl = document.getElementById('telemetryThreatsIntercepted');
+  if (thEl) thEl.innerText = inFlightInterceptsCount.toLocaleString();
+  const crEl = document.getElementById('telemetryCriticalBlocked');
+  if (crEl) crEl.innerText = inFlightCriticalCount.toLocaleString();
+  const mitEl = document.getElementById('telemetryActiveMitigations');
+  if (mitEl) mitEl.innerText = inFlightInterceptsCount.toLocaleString();
+  const countBadge = document.getElementById('threatFeedCountBadge');
+  if (countBadge) countBadge.innerText = `${inFlightInterceptsCount} INTERCEPTED`;
+
+  // Update header pill
+  const headerText = document.getElementById('headerInFlightText');
+  const headerDot = document.querySelector('.header-radar-dot');
+  if (headerText) headerText.innerText = `INTERCEPTED: ${inFlightInterceptsCount} THREATS`;
+  if (headerDot) headerDot.classList.add('intercepting');
+
+  const sevClass = threat.severity >= 9 ? 'sev-critical' : (threat.severity >= 8 ? 'sev-high' : 'sev-med');
+  const sevLabel = threat.severity >= 9 ? 'CRITICAL' : (threat.severity >= 8 ? 'HIGH' : 'MED');
+
+  const entry = document.createElement('div');
+  entry.className = `threat-entry ${sevClass}`;
+  entry.innerHTML = `
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 3px;">
+      <div style="display: flex; align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+        <span class="threat-badge-tech">${escapeHtml(threat.technique_id || 'T1190')}</span>
+        <strong style="color: #f8fafc; font-size: 11px;">${escapeHtml(threat.technique_name || 'Exploit')}</strong>
+      </div>
+      <span class="threat-badge-sev ${sevClass}">
+        ${sevLabel} ${threat.severity || 7}.0
+      </span>
+    </div>
+    <div style="display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: #94a3b8; margin-top: 2px;">
+      <span>⚡ <b style="color: #f1f5f9;">${escapeHtml(threat.source_ip || 'Remote')}</b> ➔ <b style="color: #67e8f9;">${escapeHtml(threat.dest_ip || threat.host || 'Asset')}</b></span>
+      <span class="threat-badge-mitigation">🛡️ ${escapeHtml(threat.mitigation || 'Intercepted & Mitigated')}</span>
+    </div>
+    ${threat.detail ? `<div style="font-size: 9.5px; color: #64748b; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">Signature: ${escapeHtml(threat.detail)}</div>` : ''}
+  `;
+
+  feed.appendChild(entry);
+
+  const autoScroll = document.getElementById('chkAutoScrollThreats');
+  if (!autoScroll || autoScroll.checked) {
+    feed.scrollTop = feed.scrollHeight;
+  }
+}
+
+function updateInFlightThreatState(job) {
+  if (!job) return;
+  const recEl = document.getElementById('telemetryRecordsScanned');
+  if (recEl && job.records_processed !== undefined) {
+    recEl.innerText = (job.records_processed || 0).toLocaleString();
+  }
+
+  if (job.threats_intercepted_count !== undefined) {
+    const count = job.threats_intercepted_count || 0;
+    const thEl = document.getElementById('telemetryThreatsIntercepted');
+    if (thEl) thEl.innerText = count.toLocaleString();
+    const countBadge = document.getElementById('threatFeedCountBadge');
+    if (countBadge) countBadge.innerText = `${count} INTERCEPTED`;
+    const mitEl = document.getElementById('telemetryActiveMitigations');
+    if (mitEl) mitEl.innerText = count.toLocaleString();
+
+    if (count > 0) {
+      const headerText = document.getElementById('headerInFlightText');
+      const headerDot = document.querySelector('.header-radar-dot');
+      if (headerText) headerText.innerText = `INTERCEPTED: ${count} THREATS`;
+      if (headerDot) headerDot.classList.add('intercepting');
+    }
+  }
+
+  if (job.critical_blocks_count !== undefined) {
+    const crEl = document.getElementById('telemetryCriticalBlocked');
+    if (crEl) crEl.innerText = (job.critical_blocks_count || 0).toLocaleString();
+  }
+
+  if (Array.isArray(job.in_flight_intercepts)) {
+    job.in_flight_intercepts.forEach(t => renderInFlightThreat(t));
+  }
+
+  if (job.status === 'completed') {
+    const glow = document.getElementById('inflightStatusGlow');
+    if (glow) {
+      glow.innerText = 'INGESTION COMPLETE · 100% SECURED';
+      glow.style.background = 'rgba(16, 185, 129, 0.2)';
+      glow.style.color = '#6ee7b7';
+      glow.style.borderColor = '#10b981';
+    }
+  }
+}
+
+// ── Enterprise Resumable Log Ingestion Engine (Option A: 25MB Chunks) ───────────
 let selectedUploadFile = null;
 let lastUploadedDatasetId = null;
+let currentUploader = null;
+
+class ResumableChunkUploader {
+  constructor(file, options = {}) {
+    this.file = file;
+    this.chunkSize = options.chunkSize || 25 * 1024 * 1024; // 25 MB slices
+    this.totalChunks = Math.ceil(file.size / this.chunkSize) || 1;
+    this.concurrency = options.concurrency || 4; // 4 parallel high-throughput chunk pipelines
+    this.maxRecords = options.maxRecords || null; // Unlimited by default
+    this.uploadId = this.generateUploadId(file);
+    this.uploadedChunks = new Set();
+    this.isPaused = false;
+    this.isAborted = false;
+    this.activeControllers = new Set();
+    
+    // Callbacks
+    this.onProgress = options.onProgress || (() => {});
+    this.onStatusChange = options.onStatusChange || (() => {});
+    this.onSuccess = options.onSuccess || (() => {});
+    this.onError = options.onError || (() => {});
+
+    // Metrics tracking
+    this.startTime = 0;
+    this.lastBytes = 0;
+    this.lastTime = 0;
+    this.smoothedSpeed = 0; // Bytes per second
+  }
+
+  generateUploadId(file) {
+    const raw = `${file.name}_${file.size}_${file.lastModified}`;
+    let hash = 0;
+    for (let i = 0; i < raw.length; i++) {
+      hash = ((hash << 5) - hash) + raw.charCodeAt(i);
+      hash |= 0;
+    }
+    const cleanName = file.name.replace(/[^a-zA-Z0-9_\-]/g, '').substring(0, 16);
+    return `upload_${cleanName}_${Math.abs(hash).toString(36)}`;
+  }
+
+  async checkServerStatus() {
+    try {
+      const res = await fetch(`${API_BASE}/api/upload-chunk/status?upload_id=${this.uploadId}`);
+      if (!res.ok) return [];
+      const data = await res.json();
+      if (Array.isArray(data.uploaded_chunks)) {
+        data.uploaded_chunks.forEach(idx => this.uploadedChunks.add(idx));
+      }
+      return Array.from(this.uploadedChunks);
+    } catch (e) {
+      console.warn("Could not check chunk status:", e);
+      return [];
+    }
+  }
+
+  formatBytes(bytes) {
+    if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+
+  formatEta(seconds) {
+    if (!isFinite(seconds) || seconds <= 0) return "--";
+    if (seconds < 60) return `${Math.ceil(seconds)}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.ceil(seconds % 60);
+    return `${mins}m ${secs}s`;
+  }
+
+  async start() {
+    this.isPaused = false;
+    this.isAborted = false;
+    this.startTime = Date.now();
+    this.lastTime = Date.now();
+    this.lastBytes = this.uploadedChunks.size * this.chunkSize;
+
+    // Check existing chunks on server for instant resume
+    await this.checkServerStatus();
+
+    this.onStatusChange({
+      phase: `Streaming 25MB chunk slices to server...`,
+      percent: Math.round((this.uploadedChunks.size / this.totalChunks) * 100),
+      completedChunks: this.uploadedChunks.size,
+      totalChunks: this.totalChunks,
+      speedFormatted: "-- MB/s",
+      etaFormatted: "--"
+    });
+
+    // Queue of pending chunk indices
+    const queue = [];
+    for (let i = 0; i < this.totalChunks; i++) {
+      if (!this.uploadedChunks.has(i)) {
+        queue.push(i);
+      }
+    }
+
+    if (queue.length === 0) {
+      // All chunks were already uploaded!
+      return await this.finalizeAndTrack();
+    }
+
+    // Worker pool
+    const workers = [];
+    for (let w = 0; w < Math.min(this.concurrency, queue.length); w++) {
+      workers.push(this.chunkWorker(queue));
+    }
+
+    await Promise.all(workers);
+
+    if (this.isAborted) return;
+    if (this.isPaused) {
+      this.onStatusChange({ phase: "Upload paused by user.", isPaused: true });
+      return;
+    }
+
+    // Once all chunks are transferred, trigger server assembly and background ingestion
+    await this.finalizeAndTrack();
+  }
+
+  async compressChunk(chunkBlob) {
+    if (typeof CompressionStream !== 'undefined' && !this.file.name.toLowerCase().endsWith('.gz')) {
+      try {
+        const cs = new CompressionStream('gzip');
+        const writer = cs.writable.getWriter();
+        writer.write(new Uint8Array(await chunkBlob.arrayBuffer()));
+        writer.close();
+        const compressedBlob = await new Response(cs.readable).blob();
+        if (compressedBlob.size < chunkBlob.size) {
+          return { blob: compressedBlob, isCompressed: true };
+        }
+      } catch (e) {
+        console.warn('CompressionStream fallback:', e);
+      }
+    }
+    return { blob: chunkBlob, isCompressed: false };
+  }
+
+  async chunkWorker(queue) {
+    while (queue.length > 0 && !this.isPaused && !this.isAborted) {
+      const chunkIdx = queue.shift();
+      if (chunkIdx === undefined) break;
+
+      const success = await this.uploadSingleChunkWithRetry(chunkIdx, 3);
+      if (!success) {
+        if (!this.isPaused && !this.isAborted) {
+          throw new Error(`Failed to upload chunk ${chunkIdx + 1} of ${this.totalChunks} after 3 retries.`);
+        }
+        break;
+      }
+
+      this.uploadedChunks.add(chunkIdx);
+      this.updateMetrics();
+    }
+  }
+
+  async uploadSingleChunkWithRetry(chunkIdx, maxRetries = 3) {
+    const startByte = chunkIdx * this.chunkSize;
+    const endByte = Math.min(startByte + this.chunkSize, this.file.size);
+    // Pure memory-mapped slice pointer — 0 JavaScript memory heap usage
+    const rawChunkBlob = this.file.slice(startByte, endByte);
+    const { blob: sendBlob, isCompressed } = await this.compressChunk(rawChunkBlob);
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      if (this.isPaused || this.isAborted) return false;
+
+      const controller = new AbortController();
+      this.activeControllers.add(controller);
+
+      try {
+        const formData = new FormData();
+        formData.append("upload_id", this.uploadId);
+        formData.append("chunk_index", chunkIdx);
+        formData.append("total_chunks", this.totalChunks);
+        formData.append("filename", this.file.name);
+        formData.append("is_compressed", isCompressed ? "true" : "false");
+        formData.append("chunk", sendBlob, `chunk_${chunkIdx}.part`);
+
+        const res = await fetch(`${API_BASE}/api/upload-chunk`, {
+          method: "POST",
+          body: formData,
+          signal: controller.signal
+        });
+
+        this.activeControllers.delete(controller);
+
+        if (res.ok) {
+          return true;
+        } else {
+          const errText = await res.text();
+          console.warn(`Chunk ${chunkIdx} attempt ${attempt} failed: ${errText}`);
+        }
+      } catch (err) {
+        this.activeControllers.delete(controller);
+        if (this.isPaused || this.isAborted) return false;
+        console.warn(`Chunk ${chunkIdx} attempt ${attempt} network error:`, err);
+      }
+
+      // Backoff before retry
+      await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
+    return false;
+  }
+
+  updateMetrics() {
+    const now = Date.now();
+    const dt = (now - this.lastTime) / 1000;
+    const completedBytes = Math.min(this.uploadedChunks.size * this.chunkSize, this.file.size);
+    const totalBytes = this.file.size;
+    const pct = Math.min(99, Math.round((completedBytes / totalBytes) * 100));
+
+    if (dt >= 0.5) {
+      const bytesDelta = completedBytes - this.lastBytes;
+      const currentSpeed = bytesDelta / dt; // bytes per sec
+      this.smoothedSpeed = this.smoothedSpeed === 0 ? currentSpeed : (this.smoothedSpeed * 0.7) + (currentSpeed * 0.3);
+      this.lastBytes = completedBytes;
+      this.lastTime = now;
+    }
+
+    const speedMB = (this.smoothedSpeed / (1024 * 1024)).toFixed(1);
+    const remainingBytes = Math.max(0, totalBytes - completedBytes);
+    const etaSec = this.smoothedSpeed > 0 ? remainingBytes / this.smoothedSpeed : 0;
+
+    this.onStatusChange({
+      phase: `Phase 1/4: Slicing & uploading 25MB chunks (${this.uploadedChunks.size}/${this.totalChunks})...`,
+      percent: pct,
+      completedChunks: this.uploadedChunks.size,
+      totalChunks: this.totalChunks,
+      speedFormatted: `${speedMB} MB/s`,
+      etaFormatted: this.formatEta(etaSec)
+    });
+  }
+
+  pause() {
+    this.isPaused = true;
+    for (const c of this.activeControllers) {
+      c.abort();
+    }
+    this.activeControllers.clear();
+  }
+
+  resume() {
+    if (this.isPaused) {
+      return this.start();
+    }
+  }
+
+  abort() {
+    this.isAborted = true;
+    for (const c of this.activeControllers) {
+      c.abort();
+    }
+    this.activeControllers.clear();
+    // Notify server to clean up staging folder
+    fetch(`${API_BASE}/api/upload-chunk/${this.uploadId}`, { method: "DELETE" }).catch(() => {});
+  }
+
+  async finalizeAndTrack() {
+    this.onStatusChange({
+      phase: "Phase 2/4: Reassembling 25MB chunks & preparing streaming DuckDB ingestion...",
+      percent: 99,
+      completedChunks: this.totalChunks,
+      totalChunks: this.totalChunks,
+      speedFormatted: "Assembling",
+      etaFormatted: "Finalizing"
+    });
+
+    const compRes = await fetch(`${API_BASE}/api/upload-complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        upload_id: this.uploadId,
+        filename: this.file.name,
+        total_chunks: this.totalChunks,
+        max_records: this.maxRecords || null
+      })
+    });
+
+    if (!compRes.ok) {
+      const err = await compRes.json().catch(() => ({}));
+      throw new Error(err.detail || "Upload reassembly failed on server.");
+    }
+
+    // Poll background job
+    return await this.pollJobProgress();
+  }
+
+  async pollJobProgress() {
+    while (!this.isAborted) {
+      await new Promise(r => setTimeout(r, 600));
+      if (this.isAborted) return;
+
+      try {
+        const jobRes = await fetch(`${API_BASE}/api/upload-job/${this.uploadId}`);
+        if (!jobRes.ok) continue;
+
+        const job = await jobRes.json();
+        updateInFlightThreatState(job);
+
+        if (job.status === "completed") {
+          this.onStatusChange({
+            phase: "Phase 4/4: Multi-stage incident correlation complete!",
+            percent: 100,
+            completedChunks: this.totalChunks,
+            totalChunks: this.totalChunks,
+            speedFormatted: "Done",
+            etaFormatted: "0s"
+          });
+          this.onSuccess(job.result);
+          return job.result;
+        } else if (job.status === "failed") {
+          throw new Error(job.error || "Log processing and incident correlation failed.");
+        } else {
+          // Status is processing or queued
+          const recCount = job.records_processed || 0;
+          this.onStatusChange({
+            phase: job.phase || "Processing...",
+            percent: job.progress_pct || 50,
+            completedChunks: this.totalChunks,
+            totalChunks: this.totalChunks,
+            speedFormatted: recCount > 0 ? `${recCount.toLocaleString()} recs` : "Analyzing",
+            etaFormatted: "In progress"
+          });
+        }
+      } catch (err) {
+        if (err.message && err.message.includes("failed")) {
+          throw err;
+        }
+        console.warn("Job polling glitch, retrying...", err);
+      }
+    }
+  }
+}
 
 function setupLogUploadModal() {
   const modalBackdrop = document.getElementById('uploadModalBackdrop');
   const btnOpen = document.getElementById('btnOpenUploadModal');
   const btnClose = document.getElementById('btnCloseUploadModal');
   const btnCancel = document.getElementById('btnCancelUpload');
+  const btnPauseResume = document.getElementById('btnPauseResumeUpload');
   const dropzone = document.getElementById('uploadDropzone');
   const fileInput = document.getElementById('localLogFileInput');
   const selectedInfo = document.getElementById('selectedFileInfo');
@@ -2260,36 +2799,153 @@ function setupLogUploadModal() {
   const progressBar = document.getElementById('uploadProgressBar');
   const phaseText = document.getElementById('uploadPhaseText');
   const percentText = document.getElementById('uploadPercentText');
+  const speedText = document.getElementById('uploadSpeedText');
+  const etaText = document.getElementById('uploadEtaText');
+  const chunkText = document.getElementById('uploadChunkText');
   const successCard = document.getElementById('uploadSuccessCard');
 
+  // Tabs
+  const tabLocal = document.getElementById('tabModeLocalDirect');
+  const tabBrowser = document.getElementById('tabModeBrowserUpload');
+  const paneLocal = document.getElementById('paneModeLocalDirect');
+  const paneBrowser = document.getElementById('paneModeBrowserUpload');
+  let currentTabMode = 'local'; // 'local' | 'browser'
+
   if (!modalBackdrop) return;
+
+  function switchUploadTab(mode) {
+    currentTabMode = mode;
+    if (mode === 'local') {
+      if (tabLocal) {
+        tabLocal.style.background = '#ffffff';
+        tabLocal.style.color = '#1e40af';
+        tabLocal.style.fontWeight = '700';
+        tabLocal.style.borderBottom = '2px solid #2563eb';
+      }
+      if (tabBrowser) {
+        tabBrowser.style.background = 'transparent';
+        tabBrowser.style.color = '#64748b';
+        tabBrowser.style.fontWeight = '600';
+        tabBrowser.style.borderBottom = '2px solid transparent';
+      }
+      if (paneLocal) paneLocal.style.display = 'block';
+      if (paneBrowser) paneBrowser.style.display = 'none';
+      if (btnStart) {
+        btnStart.disabled = false;
+        btnStart.innerText = '🚀 Ingest Directly (No Dividing)';
+      }
+      if (btnPauseResume) btnPauseResume.style.display = 'none';
+    } else {
+      if (tabBrowser) {
+        tabBrowser.style.background = '#ffffff';
+        tabBrowser.style.color = '#1e40af';
+        tabBrowser.style.fontWeight = '700';
+        tabBrowser.style.borderBottom = '2px solid #2563eb';
+      }
+      if (tabLocal) {
+        tabLocal.style.background = 'transparent';
+        tabLocal.style.color = '#64748b';
+        tabLocal.style.fontWeight = '600';
+        tabLocal.style.borderBottom = '2px solid transparent';
+      }
+      if (paneLocal) paneLocal.style.display = 'none';
+      if (paneBrowser) paneBrowser.style.display = 'block';
+      if (btnStart) {
+        btnStart.disabled = !selectedUploadFile;
+        btnStart.innerText = 'Start Browser Upload';
+      }
+    }
+  }
+
+  tabLocal?.addEventListener('click', () => switchUploadTab('local'));
+  tabBrowser?.addEventListener('click', () => switchUploadTab('browser'));
+
+  async function loadLocalFilesList() {
+    const container = document.getElementById('quickLocalFilesContainer');
+    if (!container) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/local-log-files`);
+      if (!res.ok) return;
+      const files = await res.json();
+      if (!files || files.length === 0) {
+        container.innerHTML = '<div style="color: #64748b; font-size: 12px;">No local log files detected in workspace root.</div>';
+        return;
+      }
+      container.innerHTML = files.map(f => `
+        <div class="local-file-card" data-path="${f.path}" data-name="${f.name}"
+          style="display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; cursor: pointer; transition: all 0.15s ease;">
+          <div>
+            <strong style="color: #1e40af; font-size: 12px;">${f.name.includes('50g') ? '🔥 ' : '📄 '}${f.name}</strong>
+            <span style="color: #64748b; font-size: 11px; margin-left: 6px;">${f.description || ''}</span>
+          </div>
+          <span style="background: #e2e8f0; color: #334155; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;">${f.size_formatted}</span>
+        </div>
+      `).join('');
+
+      container.querySelectorAll('.local-file-card').forEach(card => {
+        card.addEventListener('click', () => {
+          container.querySelectorAll('.local-file-card').forEach(c => {
+            c.style.background = '#f8fafc';
+            c.style.borderColor = '#e2e8f0';
+          });
+          card.style.background = '#eff6ff';
+          card.style.borderColor = '#3b82f6';
+          const p = card.getAttribute('data-path');
+          const n = card.getAttribute('data-name');
+          const input = document.getElementById('inputLocalFilePath');
+          const nameInput = document.getElementById('inputLocalDatasetName');
+          if (input) input.value = p;
+          if (nameInput) nameInput.value = n.includes('50g') ? 'FortiGate 50G NGFW' : n;
+        });
+      });
+    } catch (e) {
+      console.warn("Could not load local log files:", e);
+    }
+  }
 
   function openUploadModal() {
     modalBackdrop.style.display = 'flex';
     resetUploadState();
+    switchUploadTab('local');
+    loadLocalFilesList();
   }
 
   function closeUploadModal() {
+    if (currentUploader) {
+      currentUploader.abort();
+      currentUploader = null;
+    }
     modalBackdrop.style.display = 'none';
     resetUploadState();
   }
 
   function resetUploadState() {
+    if (currentUploader) {
+      currentUploader.abort();
+      currentUploader = null;
+    }
     selectedUploadFile = null;
+    resetInFlightThreatFeed();
     if (fileInput) fileInput.value = '';
     if (selectedInfo) selectedInfo.style.display = 'none';
     if (dropzone) dropzone.style.display = 'block';
     if (progressContainer) progressContainer.style.display = 'none';
     if (successCard) successCard.style.display = 'none';
+    if (btnPauseResume) {
+      btnPauseResume.style.display = 'none';
+      btnPauseResume.innerText = 'Pause';
+    }
     if (btnStart) {
-      btnStart.disabled = true;
-      btnStart.innerText = 'Start Ingestion & Analysis';
+      btnStart.disabled = false;
+      btnStart.innerText = currentTabMode === 'local' ? '🚀 Ingest Directly (No Dividing)' : 'Start Browser Upload';
     }
   }
 
   btnOpen?.addEventListener('click', openUploadModal);
   btnClose?.addEventListener('click', closeUploadModal);
   btnCancel?.addEventListener('click', closeUploadModal);
+  const headerPill = document.getElementById('headerInFlightPill');
+  headerPill?.addEventListener('click', openUploadModal);
   modalBackdrop?.addEventListener('click', (e) => {
     if (e.target.id === 'uploadModalBackdrop') closeUploadModal();
   });
@@ -2324,7 +2980,7 @@ function setupLogUploadModal() {
     resetUploadState();
   });
 
-  function handleFileSelected(file) {
+  async function handleFileSelected(file) {
     selectedUploadFile = file;
     document.getElementById('uploadSelectedName').innerText = file.name;
     const sizeStr = file.size > 1024 * 1024 * 1024 
@@ -2333,112 +2989,347 @@ function setupLogUploadModal() {
         ? `${(file.size / (1024 * 1024)).toFixed(2)} MB`
         : `${(file.size / 1024).toFixed(1)} KB`;
         
-    document.getElementById('uploadSelectedSize').innerText = `${sizeStr} • Ready for analysis`;
+    const method = document.getElementById('selectUploadMethod')?.value || 'direct';
+    document.getElementById('uploadSelectedSize').innerText = `${sizeStr} · ${method === 'direct' ? 'Direct Single Stream (No Dividing)' : 'Resumable 25MB Chunks'}`;
+    
+    const badge = document.getElementById('uploadChunkBadge');
+    if (badge) badge.innerText = method === 'direct' ? 'Direct Stream' : '25MB Chunks';
+
     dropzone.style.display = 'none';
     selectedInfo.style.display = 'block';
     btnStart.disabled = false;
   }
 
-  btnStart?.addEventListener('click', () => {
-    if (!selectedUploadFile) return;
+  btnPauseResume?.addEventListener('click', () => {
+    if (!currentUploader) return;
+    if (currentUploader.isPaused) {
+      btnPauseResume.innerText = 'Pause';
+      phaseText.innerText = 'Resuming chunk slices...';
+      currentUploader.resume();
+    } else {
+      currentUploader.pause();
+      btnPauseResume.innerText = 'Resume';
+      phaseText.innerText = 'Upload paused by user.';
+    }
+  });
 
+  btnStart?.addEventListener('click', async () => {
+    // ── PATH A: DIRECT SERVER-SIDE INGESTION (ZERO DIVIDING) ──────────────────
+    if (currentTabMode === 'local') {
+      const filePathInput = document.getElementById('inputLocalFilePath');
+      const filePath = filePathInput ? filePathInput.value.trim() : '';
+      if (!filePath) {
+        alert("Please select or specify a local log file path.");
+        return;
+      }
+
+      const limitSelect = document.getElementById('selectLocalRecordLimit');
+      const limitVal = limitSelect ? limitSelect.value : 'all';
+      const maxRecords = (limitVal === 'all' || !limitVal) ? null : parseInt(limitVal);
+
+      const nameInput = document.getElementById('inputLocalDatasetName');
+      const datasetName = nameInput ? nameInput.value.trim() : '';
+
+      resetInFlightThreatFeed();
+      btnStart.disabled = true;
+      progressContainer.style.display = 'block';
+      successCard.style.display = 'none';
+      phaseText.innerText = 'Initializing direct disk streaming (Zero Dividing)...';
+      percentText.innerText = '10%';
+      progressBar.style.width = '10%';
+      speedText.innerText = 'Starting';
+      chunkText.innerText = '0 records';
+      etaText.innerText = 'Direct Ingest';
+
+      try {
+        const res = await fetch(`${API_BASE}/api/ingest-local`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            file_path: filePath,
+            dataset_name: datasetName || undefined,
+            max_records: maxRecords
+          })
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || 'Direct ingestion request failed.');
+        }
+
+        const data = await res.json();
+        const uploadId = data.upload_id;
+
+        // Poll upload job with live in-flight threat interception
+        while (true) {
+          await new Promise(r => setTimeout(r, 600));
+          const jobRes = await fetch(`${API_BASE}/api/upload-job/${uploadId}`);
+          if (!jobRes.ok) continue;
+
+          const job = await jobRes.json();
+          updateInFlightThreatState(job);
+
+          if (job.status === 'completed') {
+            phaseText.innerText = 'Direct disk ingestion complete!';
+            percentText.innerText = '100%';
+            progressBar.style.width = '100%';
+            chunkText.innerText = `${(job.records_processed || 0).toLocaleString()} records`;
+            speedText.innerText = 'Complete';
+            etaText.innerText = 'Done';
+
+            setTimeout(() => {
+              progressContainer.style.display = 'none';
+              successCard.style.display = 'block';
+              document.getElementById('uploadSuccessMessage').innerText = job.result?.message || `Successfully ingested ${(job.records_processed || 0).toLocaleString()} records without dividing.`;
+
+              populateUploadedDatasets().then(() => {
+                const sel = document.getElementById('datasetSelector');
+                if (sel && job.result?.dataset_id) {
+                  sel.value = job.result.dataset_id;
+                  const icon = document.getElementById('datasetIcon');
+                  if (icon) {
+                    icon.innerText = '🔥';
+                    icon.style.color = '#ef4444';
+                  }
+                }
+                loadAllData();
+              });
+            }, 600);
+            break;
+          } else if (job.status === 'failed') {
+            throw new Error(job.error || 'Ingestion failed on server.');
+          } else {
+            const rec = job.records_processed || 0;
+            phaseText.innerText = job.phase || 'Ingesting records & intercepting in-flight threats...';
+            percentText.innerText = `${job.progress_pct || 30}%`;
+            progressBar.style.width = `${job.progress_pct || 30}%`;
+            chunkText.innerText = `${rec.toLocaleString()} records`;
+            speedText.innerText = 'Streaming';
+          }
+        }
+      } catch (err) {
+        progressContainer.style.display = 'none';
+        btnStart.disabled = false;
+        alert(`Direct Ingestion Error: ${err.message}`);
+      }
+      return;
+    }
+
+    // ── PATH B: BROWSER FILE UPLOAD ──────────────────────────────────────────
+    if (!selectedUploadFile) {
+      alert("Please select a log file to upload.");
+      return;
+    }
+
+    const uploadMethod = document.getElementById('selectUploadMethod')?.value || 'direct';
+    const limitSelect = document.getElementById('selectUploadRecordLimit');
+    const limitVal = limitSelect ? limitSelect.value : 'all';
+    const maxRecords = (limitVal === 'all' || !limitVal) ? null : parseInt(limitVal);
+
+    resetInFlightThreatFeed();
     btnStart.disabled = true;
     progressContainer.style.display = 'block';
     successCard.style.display = 'none';
 
-    phaseText.innerText = 'Phase 1/4: Uploading log stream to server (0%)...';
+    // Direct single-stream upload (No Dividing)
+    if (uploadMethod === 'direct') {
+      const uploadId = `stream_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      phaseText.innerText = 'Direct streaming file to server (Zero Dividing)...';
+      percentText.innerText = '0%';
+      progressBar.style.width = '0%';
+      speedText.innerText = 'Streaming';
+      etaText.innerText = '--';
+      chunkText.innerText = 'Direct Stream';
+
+      const formData = new FormData();
+      formData.append('file', selectedUploadFile);
+      formData.append('upload_id', uploadId);
+      if (maxRecords) formData.append('max_records', maxRecords);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_BASE}/api/upload-log`, true);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.min(25, Math.round((e.loaded / e.total) * 25));
+          percentText.innerText = `${pct}%`;
+          progressBar.style.width = `${pct}%`;
+          const mb = (e.loaded / (1024 * 1024)).toFixed(1);
+          const totalMb = (e.total / (1024 * 1024)).toFixed(1);
+          chunkText.innerText = `${mb} / ${totalMb} MB`;
+          speedText.innerText = 'Transferring';
+        }
+      };
+
+      xhr.onload = async () => {
+        if (xhr.status === 200) {
+          try {
+            const resp = JSON.parse(xhr.responseText);
+            if (resp.status === 'success') {
+              // Synchronous fallback result
+              percentText.innerText = '100%';
+              progressBar.style.width = '100%';
+              phaseText.innerText = 'Direct ingestion complete!';
+              updateInFlightThreatState({
+                status: 'completed',
+                records_processed: resp.total_records,
+                threats_intercepted_count: resp.threats_intercepted_count,
+                critical_blocks_count: 0,
+                in_flight_intercepts: resp.in_flight_intercepts || []
+              });
+              setTimeout(() => {
+                progressContainer.style.display = 'none';
+                successCard.style.display = 'block';
+                document.getElementById('uploadSuccessMessage').innerText = resp.message || 'Log file ingested successfully without dividing!';
+                populateUploadedDatasets().then(() => {
+                  const sel = document.getElementById('datasetSelector');
+                  if (sel && resp.dataset_id) {
+                    sel.value = resp.dataset_id;
+                    const icon = document.getElementById('datasetIcon');
+                    if (icon) {
+                      icon.innerText = '📁';
+                      icon.style.color = '#2563eb';
+                    }
+                  }
+                  loadAllData();
+                });
+              }, 600);
+            } else {
+              // Async job mode - poll upload job with live in-flight threat interception!
+              phaseText.innerText = 'Streaming records & intercepting in-flight threats...';
+              while (true) {
+                await new Promise(r => setTimeout(r, 600));
+                const jobRes = await fetch(`${API_BASE}/api/upload-job/${uploadId}`);
+                if (!jobRes.ok) continue;
+
+                const job = await jobRes.json();
+                updateInFlightThreatState(job);
+
+                if (job.status === 'completed') {
+                  phaseText.innerText = 'Direct stream ingestion complete!';
+                  percentText.innerText = '100%';
+                  progressBar.style.width = '100%';
+                  chunkText.innerText = `${(job.records_processed || 0).toLocaleString()} records`;
+                  speedText.innerText = 'Complete';
+                  etaText.innerText = 'Done';
+
+                  setTimeout(() => {
+                    progressContainer.style.display = 'none';
+                    successCard.style.display = 'block';
+                    document.getElementById('uploadSuccessMessage').innerText = job.result?.message || `Successfully ingested ${(job.records_processed || 0).toLocaleString()} records.`;
+                    populateUploadedDatasets().then(() => {
+                      const sel = document.getElementById('datasetSelector');
+                      if (sel && job.result?.dataset_id) {
+                        sel.value = job.result.dataset_id;
+                        const icon = document.getElementById('datasetIcon');
+                        if (icon) {
+                          icon.innerText = '📁';
+                          icon.style.color = '#2563eb';
+                        }
+                      }
+                      loadAllData();
+                    });
+                  }, 600);
+                  break;
+                } else if (job.status === 'failed') {
+                  throw new Error(job.error || 'Ingestion failed on server.');
+                } else {
+                  const rec = job.records_processed || 0;
+                  phaseText.innerText = job.phase || 'Ingesting records & intercepting in-flight threats...';
+                  percentText.innerText = `${job.progress_pct || 30}%`;
+                  progressBar.style.width = `${job.progress_pct || 30}%`;
+                  chunkText.innerText = `${rec.toLocaleString()} records`;
+                  speedText.innerText = 'Streaming';
+                }
+              }
+            }
+          } catch (e) {
+            progressContainer.style.display = 'none';
+            btnStart.disabled = false;
+            alert(`Upload processing error: ${e.message}`);
+          }
+        } else {
+          progressContainer.style.display = 'none';
+          btnStart.disabled = false;
+          alert(`Upload failed: ${xhr.statusText} (${xhr.responseText})`);
+        }
+      };
+
+      xhr.onerror = () => {
+        progressContainer.style.display = 'none';
+        btnStart.disabled = false;
+        alert('Upload network error occurred.');
+      };
+
+      xhr.send(formData);
+      return;
+    }
+
+    // Resumable Chunk Slices Upload
+    if (btnPauseResume) {
+      btnPauseResume.style.display = 'inline-block';
+      btnPauseResume.innerText = 'Pause';
+    }
+
+    phaseText.innerText = 'Phase 1/4: Initializing 25MB chunk pipeline...';
     percentText.innerText = '0%';
     progressBar.style.width = '0%';
+    speedText.innerText = '-- MB/s';
+    etaText.innerText = '--';
+    chunkText.innerText = '0 / 0';
 
-    const formData = new FormData();
-    formData.append('file', selectedUploadFile);
-
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${API_BASE}/api/upload-log`, true);
-
-    // Track real live upload bytes with streaming
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        const loadedStr = e.loaded > 1024 * 1024 * 1024
-          ? `${(e.loaded / (1024 * 1024 * 1024)).toFixed(2)} GB`
-          : `${(e.loaded / (1024 * 1024)).toFixed(1)} MB`;
-        const totalStr = e.total > 1024 * 1024 * 1024
-          ? `${(e.total / (1024 * 1024 * 1024)).toFixed(2)} GB`
-          : `${(e.total / (1024 * 1024)).toFixed(1)} MB`;
-
-        progressBar.style.width = `${Math.min(pct, 95)}%`;
-        percentText.innerText = `${pct}% (${loadedStr} / ${totalStr})`;
-        if (pct < 100) {
-          phaseText.innerText = `Phase 1/4: Uploading log stream to server (${pct}%)...`;
-        } else {
-          phaseText.innerText = 'Phase 2/4: Parsing records & Entity Resolution...';
-        }
-      }
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        let result = {};
-        try {
-          result = JSON.parse(xhr.responseText);
-        } catch (_) {}
-
+    currentUploader = new ResumableChunkUploader(selectedUploadFile, {
+      chunkSize: 25 * 1024 * 1024,
+      concurrency: 4,
+      maxRecords: maxRecords,
+      onStatusChange: (status) => {
+        phaseText.innerText = status.phase || 'Uploading...';
+        percentText.innerText = `${status.percent || 0}%`;
+        progressBar.style.width = `${status.percent || 0}%`;
+        if (speedText) speedText.innerText = status.speedFormatted || '-- MB/s';
+        if (etaText) etaText.innerText = status.etaFormatted || '--';
+        if (chunkText) chunkText.innerText = `${status.completedChunks || 0} / ${status.totalChunks || 0}`;
+      },
+      onSuccess: (result) => {
         lastUploadedDatasetId = result.dataset_id;
-        phaseText.innerText = 'Phase 4/4: Multi-stage incident correlation complete!';
-        percentText.innerText = '100%';
-        progressBar.style.width = '100%';
+        if (btnPauseResume) btnPauseResume.style.display = 'none';
 
         setTimeout(() => {
           progressContainer.style.display = 'none';
           successCard.style.display = 'block';
           document.getElementById('uploadSuccessMessage').innerText = result.message || 'Log file ingested and analyzed successfully!';
 
-          const sel = document.getElementById('datasetSelector');
-          if (sel) {
-            let opt = sel.querySelector(`option[value="${result.dataset_id}"]`);
-            if (!opt) {
-              opt = document.createElement('option');
-              opt.value = result.dataset_id;
-              opt.innerText = `📁 Uploaded: ${result.filename} (${(result.total_records || 0).toLocaleString()} records · New Analysis)`;
-              if (sel.children.length > 1) {
-                sel.insertBefore(opt, sel.children[1]);
-              } else {
-                sel.appendChild(opt);
+          populateUploadedDatasets().then(() => {
+            const sel = document.getElementById('datasetSelector');
+            if (sel && result.dataset_id) {
+              sel.value = result.dataset_id;
+              const icon = document.getElementById('datasetIcon');
+              if (icon) {
+                icon.innerText = '📁';
+                icon.style.color = '#2563eb';
               }
             }
-            sel.value = result.dataset_id;
-
-            const icon = document.getElementById('datasetIcon');
-            if (icon) {
-              icon.innerText = '📁';
-              icon.style.color = '#2563eb';
-            }
-          }
-
-          state.selectedIncident = null;
-          loadAllData();
-        }, 500);
-
-      } else {
+            state.selectedIncident = null;
+            loadAllData();
+          });
+        }, 600);
+      },
+      onError: (err) => {
         progressContainer.style.display = 'none';
         btnStart.disabled = false;
-        let errMsg = `HTTP ${xhr.status}`;
-        try {
-          const errData = JSON.parse(xhr.responseText);
-          if (errData.detail) errMsg = errData.detail;
-        } catch (_) {}
-        alert(`Upload failed: ${errMsg}`);
+        if (btnPauseResume) btnPauseResume.style.display = 'none';
+        alert(`Upload error: ${err.message}`);
       }
-    };
+    });
 
-    xhr.onerror = () => {
+    try {
+      await currentUploader.start();
+    } catch (err) {
       progressContainer.style.display = 'none';
       btnStart.disabled = false;
-      alert('Upload failed: Network connection interrupted or timed out.');
-    };
-
-    xhr.send(formData);
+      if (btnPauseResume) btnPauseResume.style.display = 'none';
+      alert(`Upload failed: ${err.message}`);
+    }
   });
 
   document.getElementById('btnViewUploadedGraph')?.addEventListener('click', () => {
